@@ -1,147 +1,82 @@
-# app_amount_scan_odata_offline.py
-from fastapi import FastAPI
+# app_amount_scan_odata.py
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any, Tuple
-import os, re, json
+import os, re, json, requests
 from functools import lru_cache
 
-# --- HTTP client: requests or httpx (fallback) ---
-_http_impl = None
-try:
-    import requests as _http_impl
-except Exception:
-    try:
-        import httpx as _http_impl
-    except Exception:
-        _http_impl = None  # pure offline
-
-# ---------- Config via environment (all optional now) ----------
-SAP_BASE_URL   = os.getenv("SAP_BASE_URL")   # e.g. "https://my.sap.host:443"
-SAP_USER       = os.getenv("SAP_USER")
-SAP_PASSWD     = os.getenv("SAP_PASSWD")
-SAP_DDIC_SRV   = os.getenv("SAP_DDIC_SERVICE_PATH", "/sap/opu/odata/sap/ZDDIC_META_SRV")
+# ---------- Config via environment ----------
+SAP_BASE_URL  = os.getenv("SAP_BASE_URL")   # e.g. "https://my.sap.host:443"
+SAP_USER      = os.getenv("SAP_USER")
+SAP_PASSWD    = os.getenv("SAP_PASSWD")
+# Path to your Gateway service root (no trailing slash)
+SAP_DDIC_SRV  = os.getenv("SAP_DDIC_SERVICE_PATH", "/sap/opu/odata/sap/ZDDIC_META_SRV")
+# Toggle TLS verification if you use self-signed certs in dev
 SAP_VERIFY_TLS = os.getenv("SAP_VERIFY_TLS", "true").lower() != "false"
-OFFLINE_MODE   = os.getenv("AFLE_OFFLINE", "false").lower() == "true"
 
-# Optional local DDIC catalog for offline enrichment
-# JSON format:
-# {
-#   "data_elements": {"DMBTR":{"len":23,"dec":2,"domname":"..."}},
-#   "table_fields": {"BSEG-DMBTR":{"len":23,"dec":2,"rollname":"DMBTR","domname":"..."}}
-# }
-CATALOG_PATH = os.getenv("AFLE_DDIC_CATALOG_JSON")
-DDIC_CATALOG: Optional[Dict[str, Any]] = None
-if CATALOG_PATH and os.path.exists(CATALOG_PATH):
-    try:
-        with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-            DDIC_CATALOG = json.load(f)
-    except Exception:
-        DDIC_CATALOG = None
+if not (SAP_BASE_URL and SAP_USER and SAP_PASSWD):
+    raise RuntimeError("Set SAP_BASE_URL, SAP_USER, SAP_PASSWD env vars.")
 
-# ---------- OData DDIC client with graceful offline ----------
+# ---------- OData DDIC client ----------
 class DDICClient:
-    def __init__(self):
-        self.base  = (SAP_BASE_URL or "").rstrip("/")
-        self.path  = (SAP_DDIC_SRV or "").rstrip("/")
-        self.user  = SAP_USER
-        self.passw = SAP_PASSWD
-        self.verify = SAP_VERIFY_TLS
-        self.online_enabled = (
-            not OFFLINE_MODE and
-            _http_impl is not None and
-            bool(self.base and self.user and self.passw and self.path)
-        )
-        # Precreate session if online_enabled
-        self.session = None
-        if self.online_enabled:
-            try:
-                if _http_impl.__name__ == "requests":
-                    self.session = _http_impl.Session()
-                    self.session.auth = (self.user, self.passw)
-                    self.session.headers.update({"Accept": "application/json"})
-                else:
-                    # httpx
-                    self.session = _http_impl.Client(auth=(self.user, self.passw), headers={"Accept":"application/json"}, verify=self.verify)
-            except Exception:
-                self.online_enabled = False
-                self.session = None
+    def __init__(self, base_url: str, service_path: str, user: str, passwd: str, verify: bool = True):
+        self.base = base_url.rstrip("/")
+        self.path = service_path.rstrip("/")
+        self.session = requests.Session()
+        self.session.auth = (user, passwd)
+        self.session.headers.update({"Accept": "application/json"})
+        self.verify = verify
 
     def _url(self, tail: str) -> str:
         return f"{self.base}{self.path}{tail}"
 
     @lru_cache(maxsize=2048)
     def get_data_element(self, name: str) -> Optional[Dict[str, Any]]:
-        """Try local catalog -> online OData -> None."""
         if not name:
             return None
-        # 1) local catalog
-        if DDIC_CATALOG and "data_elements" in DDIC_CATALOG:
-            hit = DDIC_CATALOG["data_elements"].get(name.upper())
-            if hit:
-                return {"len": hit.get("len"), "dec": hit.get("dec"), "domname": hit.get("domname"), "source": "catalog"}
-        # 2) online OData
-        if self.online_enabled and self.session is not None:
-            try:
-                url = self._url(f"/DataElement('{name.upper()}')")
-                r = self.session.get(url, verify=self.verify) if _http_impl.__name__ == "requests" else self.session.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict) and "d" in data:
-                        data = data["d"].get("results", data["d"])
-                    return {
-                        "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
-                        "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
-                        "domname": data.get("DOMNAME"),
-                        "source": "odata"
-                    }
-                # 404 -> None; other status -> treat as offline
-            except Exception:
-                pass
-        # 3) offline
-        return None
+        url = self._url(f"/DataElement('{name.upper()}')")
+        r = self.session.get(url, verify=self.verify)
+        if r.status_code == 200:
+            data = r.json()
+            # support both plain JSON entity and OData v2 {"d":{"results":...}} styles
+            if "d" in data:
+                data = data["d"].get("results", data["d"])
+            return {
+                "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
+                "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
+                "domname": data.get("DOMNAME")
+            }
+        elif r.status_code == 404:
+            return None
+        else:
+            raise HTTPException(status_code=502, detail=f"DDIC DataElement fetch failed {r.status_code}: {r.text}")
 
     @lru_cache(maxsize=4096)
     def get_table_field(self, tabname: str, fieldname: str) -> Optional[Dict[str, Any]]:
-        """Try local catalog -> online OData -> None."""
         if not (tabname and fieldname):
             return None
-        key = f"{tabname.upper()}-{fieldname.upper()}"
-        # 1) local catalog
-        if DDIC_CATALOG and "table_fields" in DDIC_CATALOG:
-            hit = DDIC_CATALOG["table_fields"].get(key)
-            if hit:
-                return {
-                    "len": hit.get("len"),
-                    "dec": hit.get("dec"),
-                    "rollname": hit.get("rollname"),
-                    "domname": hit.get("domname"),
-                    "source": "catalog"
-                }
-        # 2) online OData
-        if self.online_enabled and self.session is not None:
-            try:
-                url = self._url(f"/TableField(Tabname='{tabname.upper()}',Fieldname='{fieldname.upper()}')")
-                r = self.session.get(url, verify=self.verify) if _http_impl.__name__ == "requests" else self.session.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict) and "d" in data:
-                        data = data["d"].get("results", data["d"])
-                    return {
-                        "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
-                        "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
-                        "rollname": data.get("ROLLNAME"),
-                        "domname": data.get("DOMNAME"),
-                        "source": "odata"
-                    }
-            except Exception:
-                pass
-        # 3) offline
-        return None
+        url = self._url(f"/TableField(Tabname='{tabname.upper()}',Fieldname='{fieldname.upper()}')")
+        r = self.session.get(url, verify=self.verify)
+        if r.status_code == 200:
+            data = r.json()
+            if "d" in data:
+                data = data["d"].get("results", data["d"])
+            return {
+                "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
+                "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
+                "rollname": data.get("ROLLNAME"),
+                "domname": data.get("DOMNAME")
+            }
+        elif r.status_code == 404:
+            return None
+        else:
+            raise HTTPException(status_code=502, detail=f"DDIC TableField fetch failed {r.status_code}: {r.text}")
 
-ddic = DDICClient()
+# single client instance
+ddic = DDICClient(SAP_BASE_URL, SAP_DDIC_SRV, SAP_USER, SAP_PASSWD, SAP_VERIFY_TLS)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Amount Field Scanner (AFLE) via OData DDIC (offline-capable)", version="1.1")
+app = FastAPI(title="Amount Field Scanner (AFLE) via OData DDIC", version="1.0")
 
 # ---------- Input model ----------
 class Unit(BaseModel):
@@ -154,7 +89,7 @@ class Unit(BaseModel):
     end_line: int = 0
     code: str
 
-# ---------- Regexes ----------
+# ---------- Regexes (same as pyrfc version) ----------
 DECL_CHAR_LEN_PAREN = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*\((\d+)\)\s*TYPE\s*C\b", re.IGNORECASE)
 DECL_CHAR_LEN_EXPL  = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s*C\b[^.\n]*?\bLENGTH\b\s*(\d+)", re.IGNORECASE)
 DECL_PACKED         = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+P\b[^.\n]*?(LENGTH\s+(\d+))?[^.\n]*?(DECIMALS\s+(\d+))?", re.IGNORECASE)
@@ -209,7 +144,7 @@ def pack_issue(unit, issue_type, message, severity, start, end, meta=None):
         "meta": meta or {}
     }
 
-# ---------- Local symbols + DDIC-aware lookup (offline-capable) ----------
+# ---------- Local symbols + DDIC-aware lookup ----------
 DECL_SPLIT = re.compile(r"\.", re.DOTALL)
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
@@ -232,7 +167,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
         if m:
             st[m.group(2).lower()] = {"kind":"dec","len":int(m.group(4)) if m.group(4) else None,
                                       "dec":int(m.group(6)) if m.group(6) else None}
-        # TYPE <de> -> DDIC (via catalog/odata/none)
+        # TYPE <de> -> DDIC
         m = DECL_TYPE_GENERIC.search(s)
         if m:
             var, de = m.group(2).lower(), m.group(3)
@@ -244,20 +179,18 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
 
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
     t = token.strip().upper()
-    # table-field?
     if "-" in t:
         parts = t.split("-")
         if len(parts) == 2:
             tf = ddic.get_table_field(parts[0], parts[1])
             if tf:
                 kind = "amount" if tf.get("dec") is not None else "char"
-                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source", "unknown")}
+                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source":"table_field"}
         return None
-    # data element?
     de = ddic.get_data_element(t)
     if de:
         kind = "amount" if de.get("dec") is not None else "char"
-        return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source", "unknown")}
+        return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source":"data_element"}
     return None
 
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
@@ -500,12 +433,6 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
     res = unit.model_dump()
     res["amount_findings"] = findings
-    # annotate scanner mode for transparency
-    res["_scanner_mode"] = {
-        "online_enabled": ddic.online_enabled,
-        "http_client": None if _http_impl is None else _http_impl.__name__,
-        "catalog_loaded": bool(DDIC_CATALOG is not None)
-    }
     return res
 
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
@@ -514,18 +441,21 @@ def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     return [scan_unit(u, symtab) for u in units]
 
 # ---------- API ----------
-app = FastAPI(title="Amount Field Scanner (AFLE) via OData DDIC — offline-capable", version="1.1")
-
 @app.post("/scan-amount")
 def scan_amount(units: List[Unit]):
-    # No connectivity probe—always proceed
+    # quick connectivity ping (optional)
+    try:
+        _ = ddic.get_data_element("DMBTR")  # cache + connectivity test (won't error on 404)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"DDIC service connectivity failed: {e}")
     return analyze_units(units)
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "online_enabled": ddic.online_enabled,
-        "http_client": None if _http_impl is None else _http_impl.__name__,
-        "catalog_loaded": bool(DDIC_CATALOG is not None)
-    }
+    try:
+        _ = ddic.get_data_element("DMBTR")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
