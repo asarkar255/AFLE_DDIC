@@ -1,149 +1,40 @@
-# app_amount_scan_odata_offline.py
+# app_amount_scan_webaware_decl_multiline.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Any, Tuple
-import os, re, json
+from typing import List, Dict, Optional, Any
+import os, re
 from functools import lru_cache
 
-# --- HTTP client: requests or httpx (fallback) ---
-_http_impl = None
+# =========================
+# Config (all optional)
+# =========================
+SAP_BASE_URL   = os.getenv("SAP_BASE_URL", "").rstrip("/")
+SAP_USER       = os.getenv("SAP_USER", "")
+SAP_PASSWD     = os.getenv("SAP_PASSWD", "")
+SAP_DDIC_SRV   = os.getenv("SAP_DDIC_SERVICE_PATH", "/sap/opu/odata/sap/ZDDIC_META_SRV").rstrip("/")
+SAP_VERIFY_TLS = os.getenv("SAP_VERIFY_TLS", "true").lower() != "false"
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+TAVILY_ENDPOINT = os.getenv("TAVILY_ENDPOINT", "https://api.tavily.com/search")
+
+# HTTP client (requests → httpx → None)
+_http = None
 try:
-    import requests as _http_impl
+    import requests as _http
 except Exception:
     try:
-        import httpx as _http_impl
+        import httpx as _http
     except Exception:
-        _http_impl = None  # pure offline
+        _http = None
 
-# ---------- Config via environment (all optional now) ----------
-SAP_BASE_URL   = os.getenv("SAP_BASE_URL")   # e.g. "https://my.sap.host:443"
-SAP_USER       = os.getenv("SAP_USER")
-SAP_PASSWD     = os.getenv("SAP_PASSWD")
-SAP_DDIC_SRV   = os.getenv("SAP_DDIC_SERVICE_PATH", "/sap/opu/odata/sap/ZDDIC_META_SRV")
-SAP_VERIFY_TLS = os.getenv("SAP_VERIFY_TLS", "true").lower() != "false"
-OFFLINE_MODE   = os.getenv("AFLE_OFFLINE", "false").lower() == "true"
+app = FastAPI(
+    title="Amount Field Scanner (AFLE) — SAP optional, Tavily web-aware, decl-site findings, multi-line decls",
+    version="1.4"
+)
 
-# Optional local DDIC catalog for offline enrichment
-# JSON format:
-# {
-#   "data_elements": {"DMBTR":{"len":23,"dec":2,"domname":"..."}},
-#   "table_fields": {"BSEG-DMBTR":{"len":23,"dec":2,"rollname":"DMBTR","domname":"..."}}
-# }
-CATALOG_PATH = os.getenv("AFLE_DDIC_CATALOG_JSON")
-DDIC_CATALOG: Optional[Dict[str, Any]] = None
-if CATALOG_PATH and os.path.exists(CATALOG_PATH):
-    try:
-        with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-            DDIC_CATALOG = json.load(f)
-    except Exception:
-        DDIC_CATALOG = None
-
-# ---------- OData DDIC client with graceful offline ----------
-class DDICClient:
-    def __init__(self):
-        self.base  = (SAP_BASE_URL or "").rstrip("/")
-        self.path  = (SAP_DDIC_SRV or "").rstrip("/")
-        self.user  = SAP_USER
-        self.passw = SAP_PASSWD
-        self.verify = SAP_VERIFY_TLS
-        self.online_enabled = (
-            not OFFLINE_MODE and
-            _http_impl is not None and
-            bool(self.base and self.user and self.passw and self.path)
-        )
-        # Precreate session if online_enabled
-        self.session = None
-        if self.online_enabled:
-            try:
-                if _http_impl.__name__ == "requests":
-                    self.session = _http_impl.Session()
-                    self.session.auth = (self.user, self.passw)
-                    self.session.headers.update({"Accept": "application/json"})
-                else:
-                    # httpx
-                    self.session = _http_impl.Client(auth=(self.user, self.passw), headers={"Accept":"application/json"}, verify=self.verify)
-            except Exception:
-                self.online_enabled = False
-                self.session = None
-
-    def _url(self, tail: str) -> str:
-        return f"{self.base}{self.path}{tail}"
-
-    @lru_cache(maxsize=2048)
-    def get_data_element(self, name: str) -> Optional[Dict[str, Any]]:
-        """Try local catalog -> online OData -> None."""
-        if not name:
-            return None
-        # 1) local catalog
-        if DDIC_CATALOG and "data_elements" in DDIC_CATALOG:
-            hit = DDIC_CATALOG["data_elements"].get(name.upper())
-            if hit:
-                return {"len": hit.get("len"), "dec": hit.get("dec"), "domname": hit.get("domname"), "source": "catalog"}
-        # 2) online OData
-        if self.online_enabled and self.session is not None:
-            try:
-                url = self._url(f"/DataElement('{name.upper()}')")
-                r = self.session.get(url, verify=self.verify) if _http_impl.__name__ == "requests" else self.session.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict) and "d" in data:
-                        data = data["d"].get("results", data["d"])
-                    return {
-                        "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
-                        "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
-                        "domname": data.get("DOMNAME"),
-                        "source": "odata"
-                    }
-                # 404 -> None; other status -> treat as offline
-            except Exception:
-                pass
-        # 3) offline
-        return None
-
-    @lru_cache(maxsize=4096)
-    def get_table_field(self, tabname: str, fieldname: str) -> Optional[Dict[str, Any]]:
-        """Try local catalog -> online OData -> None."""
-        if not (tabname and fieldname):
-            return None
-        key = f"{tabname.upper()}-{fieldname.upper()}"
-        # 1) local catalog
-        if DDIC_CATALOG and "table_fields" in DDIC_CATALOG:
-            hit = DDIC_CATALOG["table_fields"].get(key)
-            if hit:
-                return {
-                    "len": hit.get("len"),
-                    "dec": hit.get("dec"),
-                    "rollname": hit.get("rollname"),
-                    "domname": hit.get("domname"),
-                    "source": "catalog"
-                }
-        # 2) online OData
-        if self.online_enabled and self.session is not None:
-            try:
-                url = self._url(f"/TableField(Tabname='{tabname.upper()}',Fieldname='{fieldname.upper()}')")
-                r = self.session.get(url, verify=self.verify) if _http_impl.__name__ == "requests" else self.session.get(url)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict) and "d" in data:
-                        data = data["d"].get("results", data["d"])
-                    return {
-                        "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
-                        "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
-                        "rollname": data.get("ROLLNAME"),
-                        "domname": data.get("DOMNAME"),
-                        "source": "odata"
-                    }
-            except Exception:
-                pass
-        # 3) offline
-        return None
-
-ddic = DDICClient()
-
-# ---------- FastAPI ----------
-app = FastAPI(title="Amount Field Scanner (AFLE) via OData DDIC (offline-capable)", version="1.1")
-
-# ---------- Input model ----------
+# =========================
+# Models
+# =========================
 class Unit(BaseModel):
     pgm_name: str
     inc_name: str
@@ -154,7 +45,9 @@ class Unit(BaseModel):
     end_line: int = 0
     code: str
 
-# ---------- Regexes ----------
+# =========================
+# Regexes (AFLE scanning)
+# =========================
 DECL_CHAR_LEN_PAREN = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*\((\d+)\)\s*TYPE\s*C\b", re.IGNORECASE)
 DECL_CHAR_LEN_EXPL  = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s*C\b[^.\n]*?\bLENGTH\b\s*(\d+)", re.IGNORECASE)
 DECL_PACKED         = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+P\b[^.\n]*?(LENGTH\s+(\d+))?[^.\n]*?(DECIMALS\s+(\d+))?", re.IGNORECASE)
@@ -180,9 +73,62 @@ REUSE_ALV_LOAD      = re.compile(r"\bREUSE_ALV_EXTRACT_LOAD\b", re.IGNORECASE)
 I_ACCEPT_PADDING    = re.compile(r"I_ACCEPT_PADDING\s*=\s*'X'", re.IGNORECASE)
 CDS_CAST_DEC        = re.compile(r"\bcast\s*\([^)]+as\s+abap\.(?:dec|curr)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)", re.IGNORECASE)
 CDS_UNION           = re.compile(r"\bselect\b.+\bunion\b", re.IGNORECASE | re.DOTALL)
+
 AMOUNT_NAME_HINT    = re.compile(r"(dmbtr|wrbtr|bapicurr|betrag|amount|amt|kbetr|netwr|mwskz)", re.IGNORECASE)
 
-# ---------- Helpers ----------
+# For declaration indexing (line-by-line single-entry)
+DECL_LINE_PATTERNS = [
+    re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s*:\s*(\w+)\b.*\.\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s+(\w+)\b.*\.\s*$", re.IGNORECASE),
+    re.compile(r"^\s*FIELD-SYMBOLS\s*<(\w+)>\b.*\.\s*$", re.IGNORECASE),
+]
+
+# --- New for multi-line colon-style declarations ---
+def iter_statements_with_offsets(src: str):
+    """Yield (statement_text, start_offset, end_offset) for each '.'-terminated statement."""
+    buf = []
+    start_off = 0
+    for i, ch in enumerate(src):
+        buf.append(ch)
+        if ch == ".":
+            stmt = "".join(buf)
+            yield stmt, start_off, i + 1
+            buf = []
+            start_off = i + 1
+    if buf:
+        yield "".join(buf), start_off, len(src)
+
+def smart_split_commas(s: str):
+    """Split a multi-declaration body by commas, respecting quotes."""
+    parts, cur, q, i = [], [], False, 0
+    while i < len(s):
+        c = s[i]
+        if c == "'":
+            q = not q
+            cur.append(c)
+        elif c == "," and not q:
+            parts.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        parts.append("".join(cur).strip())
+    return [p for p in parts if p]
+
+DECL_HEADER_COLON = re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+
+DECL_ENTRY = re.compile(
+    r"^\s*(?P<var>\w+)\s*(?:"
+    r"TYPE\s+(?P<dtype>\w+)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?"
+    r"|LIKE\s+(?P<like>\w+)"
+    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"
+    r")?",
+    re.IGNORECASE
+)
+
+# =========================
+# Utilities
+# =========================
 def line_of_offset(text: str, off: int) -> int:
     return text.count("\n", 0, off) + 1
 
@@ -209,21 +155,188 @@ def pack_issue(unit, issue_type, message, severity, start, end, meta=None):
         "meta": meta or {}
     }
 
-# ---------- Local symbols + DDIC-aware lookup (offline-capable) ----------
+def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
+                    issue_type: str, message: str, severity: str, meta=None):
+    return {
+        "pgm_name": decl_unit.pgm_name,
+        "inc_name": decl_unit.inc_name,
+        "type": decl_unit.type,
+        "name": decl_unit.name,
+        "class_implementation": decl_unit.class_implementation,
+        "start_line": decl_unit.start_line,
+        "end_line": decl_unit.end_line,
+        "issue_type": issue_type,
+        "severity": severity,
+        "line": decl_line,
+        "message": message,
+        "suggestion": (meta or {}).pop("suggestion", ""),
+        "snippet": decl_text,
+        "meta": meta or {}
+    }
+
+# =========================
+# Resolvers: SAP → Tavily → Regex
+# =========================
+class SAPOData:
+    def __init__(self):
+        self.enabled = bool(_http and SAP_BASE_URL and SAP_USER and SAP_PASSWD and SAP_DDIC_SRV)
+        if self.enabled and _http.__name__ == "requests":
+            self.session = _http.Session()
+            self.session.auth = (SAP_USER, SAP_PASSWD)
+            self.session.headers.update({"Accept": "application/json"})
+        elif self.enabled and _http.__name__ == "httpx":
+            self.session = _http.Client(auth=(SAP_USER, SAP_PASSWD), headers={"Accept":"application/json"}, verify=SAP_VERIFY_TLS)
+        else:
+            self.session = None
+            self.enabled = False
+
+    def _url(self, tail: str) -> str:
+        return f"{SAP_BASE_URL}{SAP_DDIC_SRV}{tail}"
+
+    @lru_cache(maxsize=1024)
+    def data_element(self, name: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not name:
+            return None
+        try:
+            url = self._url(f"/DataElement('{name.upper()}')")
+            r = self.session.get(url, verify=SAP_VERIFY_TLS) if _http.__name__ == "requests" else self.session.get(url)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if isinstance(data, dict) and "d" in data:
+                data = data["d"].get("results", data["d"])
+            return {
+                "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
+                "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
+                "domname": data.get("DOMNAME"),
+                "source": "sap_odata"
+            }
+        except Exception:
+            return None
+
+    @lru_cache(maxsize=2048)
+    def table_field(self, tab: str, field: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not (tab and field):
+            return None
+        try:
+            url = self._url(f"/TableField(Tabname='{tab.upper()}',Fieldname='{field.upper()}')")
+            r = self.session.get(url, verify=SAP_VERIFY_TLS) if _http.__name__ == "requests" else self.session.get(url)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if isinstance(data, dict) and "d" in data:
+                data = data["d"].get("results", data["d"])
+            return {
+                "len": int(data.get("LENG")) if data.get("LENG") not in (None, "") else None,
+                "dec": int(data.get("DECIMALS")) if data.get("DECIMALS") not in (None, "") else None,
+                "rollname": data.get("ROLLNAME"),
+                "domname": data.get("DOMNAME"),
+                "source": "sap_odata"
+            }
+        except Exception:
+            return None
+
+class TavilyResolver:
+    def __init__(self):
+        self.enabled = bool(_http and TAVILY_API_KEY)
+
+    def _search(self, query: str) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            payload = {
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "include_answer": False,
+                "include_images": False,
+                "max_results": 5
+            }
+            resp = _http.post(TAVILY_ENDPOINT, json=payload, timeout=20)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data.get("results", [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _parse_lengths(text: str) -> Dict[str, Optional[int]]:
+        text = text or ""
+        m = re.search(r"(\d{2})\s+digits?\s+including\s+(\d)\s+decimals?", text, re.IGNORECASE)
+        if m:
+            return {"len": int(m.group(1)), "dec": int(m.group(2))}
+        m = re.search(r"length\s*[:=]\s*(\d+)", text, re.IGNORECASE)
+        n = re.search(r"decimals?\s*[:=]\s*(\d+)", text, re.IGNORECASE)
+        return {"len": int(m.group(1)) if m else None, "dec": int(n.group(1)) if n else None}
+
+    def data_element(self, name: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not name:
+            return None
+        q = f"SAP data element {name} length decimals"
+        for r in self._search(q):
+            meta = self._parse_lengths((r.get("snippet") or "") + " " + (r.get("content") or ""))
+            if meta["len"] or meta["dec"] is not None:
+                meta["source"] = "tavily"
+                return meta
+        return None
+
+    def table_field(self, tab: str, field: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not (tab and field):
+            return None
+        q = f"SAP table {tab} field {field} length decimals"
+        for r in self._search(q):
+            meta = self._parse_lengths((r.get("snippet") or "") + " " + (r.get("content") or ""))
+            if meta["len"] or meta["dec"] is not None:
+                meta["source"] = "tavily"
+                return meta
+        return None
+
+sap = SAPOData()
+tav = TavilyResolver()
+
+# =========================
+# Symbol table & lookups
+# =========================
 DECL_SPLIT = re.compile(r"\.", re.DOTALL)
+
+def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    t = token.strip().upper()
+
+    # Table-field like BSEG-DMBTR?
+    if "-" in t:
+        parts = t.split("-")
+        if len(parts) == 2:
+            tab, fld = parts[0], parts[1]
+            tf = sap.table_field(tab, fld) or tav.table_field(tab, fld)
+            if tf:
+                kind = "amount" if tf.get("dec") is not None else "char"
+                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+            if AMOUNT_NAME_HINT.search(fld):
+                return {"len": None, "dec": None, "kind": "amount", "source": "regex_name_hint"}
+        return None
+
+    # Data element like DMBTR?
+    de = sap.data_element(t) or tav.data_element(t)
+    if de:
+        kind = "amount" if de.get("dec") is not None else "char"
+        return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source")}
+    if AMOUNT_NAME_HINT.search(t):
+        return {"len": None, "dec": None, "kind": "amount", "source": "regex_name_hint"}
+    return None
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
     st: Dict[str, Dict[str, Any]] = {}
-    for stmt in DECL_SPLIT.split(full_src):
+    for stmt, _, _ in iter_statements_with_offsets(full_src):
         s = stmt.strip()
         if not s:
             continue
-        # CHAR
+        # existing single-line patterns
         m = DECL_CHAR_LEN_PAREN.search(s)
         if m: st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
         m = DECL_CHAR_LEN_EXPL.search(s)
         if m: st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
-        # P/DEC
         m = DECL_PACKED.search(s)
         if m:
             st[m.group(2).lower()] = {"kind":"packed","len":int(m.group(4)) if m.group(4) else None,
@@ -232,7 +345,6 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
         if m:
             st[m.group(2).lower()] = {"kind":"dec","len":int(m.group(4)) if m.group(4) else None,
                                       "dec":int(m.group(6)) if m.group(6) else None}
-        # TYPE <de> -> DDIC (via catalog/odata/none)
         m = DECL_TYPE_GENERIC.search(s)
         if m:
             var, de = m.group(2).lower(), m.group(3)
@@ -240,30 +352,115 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
             if info:
                 st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
                            "len": info["len"], "dec": info["dec"], "ddic": de}
+
+        # NEW: multi-line colon header
+        mcol = DECL_HEADER_COLON.match(s)
+        if not mcol:
+            continue
+        body = mcol.group(2)
+        if body.endswith("."):
+            body = body[:-1]
+        for ent in smart_split_commas(body):
+            em = DECL_ENTRY.match(ent)
+            if not em:
+                continue
+            var = (em.group("var") or "").lower()
+            if not var:
+                continue
+            if em.group("charlen"):
+                st[var] = {"kind":"char","len":int(em.group("charlen"))}
+                continue
+            dtype = (em.group("dtype") or "").upper()
+            if dtype in {"P","DEC"}:
+                ln = int(em.group("len")) if em.group("len") else None
+                dc = int(em.group("dec")) if em.group("dec") else None
+                st[var] = {"kind":"packed" if dtype=="P" else "dec","len":ln,"dec":dc}
+                continue
+            ddic = (em.group("dtype") or em.group("like"))
+            if ddic:
+                info = ddic_lookup_token(ddic)
+                if info:
+                    st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
+                               "len": info["len"], "dec": info["dec"], "ddic": ddic}
+                else:
+                    st.setdefault(var, {"kind":"char","len":None,"ddic":ddic})
     return st
 
-def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    t = token.strip().upper()
-    # table-field?
-    if "-" in t:
-        parts = t.split("-")
-        if len(parts) == 2:
-            tf = ddic.get_table_field(parts[0], parts[1])
-            if tf:
-                kind = "amount" if tf.get("dec") is not None else "char"
-                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source", "unknown")}
-        return None
-    # data element?
-    de = ddic.get_data_element(t)
-    if de:
-        kind = "amount" if de.get("dec") is not None else "char"
-        return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source", "unknown")}
-    return None
+# =========================
+# Declaration index (cross-include, multi-line aware)
+# =========================
+class DeclSite:
+    __slots__ = ("var","unit_idx","line","text")
+    def __init__(self, var: str, unit_idx: int, line: int, text: str):
+        self.var = var
+        self.unit_idx = unit_idx
+        self.line = line
+        self.text = text
 
+def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
+    """
+    var_name_lower -> [DeclSite, ...]
+    Uses statement iteration to capture single-line and multi-line colon blocks with line numbers.
+    """
+    index: Dict[str, List[DeclSite]] = {}
+    for uidx, u in enumerate(units):
+        src = u.code or ""
+        for stmt, s_off, e_off in iter_statements_with_offsets(src):
+            stripped = stmt.strip()
+
+            # single-line patterns
+            matched_single = False
+            for pat in DECL_LINE_PATTERNS:
+                m = pat.match(stripped)
+                if m:
+                    if pat.pattern.startswith(r"^\s*FIELD-SYMBOLS"):
+                        var = (m.group(1) or "").lower()
+                    else:
+                        var = (m.group(2) or "").lower()
+                    if var:
+                        index.setdefault(var, []).append(DeclSite(var, uidx, line_of_offset(src, s_off), stripped))
+                        matched_single = True
+                    break
+            # continue to check multi-line too (same statement can satisfy both)
+
+            # multi-line colon block
+            mcol = DECL_HEADER_COLON.match(stripped)
+            if not mcol:
+                continue
+            body = mcol.group(2)
+            if body.endswith("."):
+                body = body[:-1]
+            entries = smart_split_commas(body)
+            rel = 0
+            # compute offset where 'body' starts within 'stmt'
+            body_rel_off = stripped.find(body)
+            stmt_abs_start = s_off + (len(stmt) - len(stripped))  # adjust for leading spaces trimmed by strip
+            for ent in entries:
+                if not ent:
+                    continue
+                subpos = body.find(ent, rel)
+                if subpos < 0:
+                    subpos = rel
+                ent_abs_off = stmt_abs_start + body_rel_off + subpos
+                rel = subpos + len(ent)
+
+                em = DECL_ENTRY.match(ent)
+                if not em:
+                    continue
+                var = (em.group("var") or "").lower()
+                if not var:
+                    continue
+                line_no = line_of_offset(src, ent_abs_off)
+                index.setdefault(var, []).append(DeclSite(var, uidx, line_no, ent.strip()))
+    return index
+
+# =========================
+# AFLE sizing helpers
+# =========================
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
-    expr = expr.strip()
+    expr = (expr or "").strip()
     dd = ddic_lookup_token(expr)
-    if dd and (dd["dec"] is not None or AMOUNT_NAME_HINT.search(expr)):
+    if dd and dd["kind"] == "amount":
         return True
     mv = re.match(r"^(\w+)$", expr)
     if mv:
@@ -276,27 +473,75 @@ def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int =
     dd = ddic_lookup_token(token)
     if dd and dd["kind"] == "char":
         ln = dd.get("len") or 0
-        return ln < min_len
-    info = symtab.get(token.lower())
+        return (ln < min_len) if ln else None
+    info = symtab.get((token or "").lower())
     if not info: return None
     if info["kind"] == "char":
-        return (info.get("len") or 0) < min_len
+        ln = info.get("len") or 0
+        return (ln < min_len) if ln else None
     return False
 
 def dec_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_digits: int = 23) -> Optional[bool]:
     dd = ddic_lookup_token(token)
     if dd and dd["kind"] in {"amount","dec","packed"}:
         ln = dd.get("len") or 0
-        return ln and (ln < min_digits)
-    info = symtab.get(token.lower())
+        return (ln < min_digits) if ln else None
+    info = symtab.get((token or "").lower())
     if not info: return None
     if info["kind"] in {"packed","dec","amount"}:
         ln = info.get("len") or 0
-        return ln and (ln < min_digits)
+        return (ln < min_digits) if ln else None
     return False
 
-# ---------- Scanner ----------
-def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+# =========================
+# Scanner (with decl-site mirrors)
+# =========================
+class MirrorBucket(Dict[int, List[Dict[str, Any]]]):
+    pass
+
+def _emit_decl_mirrors(dest_token: str,
+                       usage_issue_type: str,
+                       usage_severity: str,
+                       usage_unit: Unit,
+                       usage_line: int,
+                       decl_index: Dict[str, List[DeclSite]],
+                       units: List[Unit],
+                       mirror_buckets: MirrorBucket,
+                       too_small: Optional[bool]):
+    if not re.match(r"^[A-Za-z_]\w*$", dest_token or ""):
+        return
+    decls = decl_index.get(dest_token.lower()) or []
+    if not decls:
+        return
+    for d in decls:
+        decl_unit = units[d.unit_idx]
+        if too_small is True:
+            msg = f"Declaration of '{dest_token}' appears too small for AFLE amounts used in {usage_unit.inc_name}/{usage_unit.name} at line {usage_line}."
+            sev = usage_severity  # typically 'error'
+            sug = "Widen the declared type to an AFLE-safe amount (e.g., DDIC amount or P LENGTH 23 DECIMALS 2)."
+            itype = "DeclarationAFLESizeRisk"
+        else:
+            msg = f"Declaration of '{dest_token}' may be insufficient for AFLE amounts used in {usage_unit.inc_name}/{usage_unit.name} at line {usage_line} (destination capacity unknown)."
+            sev = "info" if usage_severity == "info" else "warning"
+            sug = "Verify the declared type supports AFLE (≥23,2) or adjust DDIC element."
+            itype = "DeclarationAFLECapacityUnknown"
+        mirror = pack_decl_issue(
+            decl_unit=decl_unit,
+            decl_line=d.line,
+            decl_text=d.text,
+            issue_type=itype,
+            message=msg,
+            severity=sev,
+            meta={"suggestion": sug}
+        )
+        mirror_buckets.setdefault(d.unit_idx, []).append(mirror)
+
+def scan_unit(unit_idx: int,
+              unit: Unit,
+              symtab: Dict[str, Dict[str, Any]],
+              decl_index: Dict[str, List[DeclSite]],
+              units: List[Unit],
+              mirror_buckets: MirrorBucket) -> Dict[str, Any]:
     src = unit.code or ""
     findings: List[Dict[str, Any]] = []
 
@@ -307,7 +552,7 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
             findings.append(pack_issue(unit, "ConcatenationDetected",
                                        "Amount used in CONCATENATE; string ops ignore scale/precision.",
                                        "warning", m.start(), m.end(),
-                                       {"suggestion":"Avoid amount concatenation; format for UI only."}))
+                                       {"suggestion":"Avoid amount concatenation; format only for UI."}))
     for m in STRING_OP_AND.finditer(src):
         seg = m.group(0)
         if any(is_amount_like(symtab, x.strip()) for x in re.split(r"&&", seg)):
@@ -316,10 +561,11 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
                                        "warning", m.start(), m.end(),
                                        {"suggestion":"Avoid string ops with amounts; use formatting."}))
     for m in STRING_TEMPLATE.finditer(src):
-        findings.append(pack_issue(unit, "ConcatenationDetected",
-                                   "Amount used in string template.",
-                                   "info", m.start(), m.end(),
-                                   {"suggestion":"Templates OK for UI; avoid persisting templates."}))
+        if is_amount_like(symtab, m.group(0)):
+            findings.append(pack_issue(unit, "ConcatenationDetected",
+                                       "Amount used in string template.",
+                                       "info", m.start(), m.end(),
+                                       {"suggestion":"Templates OK for UI; avoid persisting templates."}))
 
     # 3) Offset/length
     for m in OFFSET_LEN.finditer(src):
@@ -330,39 +576,39 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
                                        "warning", m.start(), m.end(),
                                        {"suggestion":"Do not slice amounts; use numeric ops/formatting."}))
 
-    # 4) Old move length conflict
+    # 4) Old move length conflict (MOVE ...)
     for m in MOVE_STMT.finditer(src):
         src_exp, dest = m.group(1).strip(), m.group(2)
         if is_amount_like(symtab, src_exp):
             cshort = char_too_short(symtab, dest)
             dshort = dec_too_short(symtab, dest)
-            if cshort is True or dshort is True:
-                findings.append(pack_issue(unit, "OldMoveLengthConflict",
-                                           f"Moving amount into too-small destination {dest}.",
-                                           "error", m.start(), m.end(),
-                                           {"suggestion":"Use AFLE-safe type (DDIC amount or P LENGTH 23 DECIMALS 2)."}))
-            elif cshort is None and dshort is None:
-                findings.append(pack_issue(unit, "OldMoveLengthConflict",
-                                           f"Move from amount into {dest} (destination type unknown).",
-                                           "info", m.start(), m.end(),
-                                           {"suggestion":"Verify {dest} capacity (≥23,2) or adjust DDIC element."}))
+            too_small = (cshort is True) or (dshort is True)
+            sev = "error" if too_small else "info"
+            usage = pack_issue(unit, "OldMoveLengthConflict",
+                               f"Moving amount into {dest} " + ("(too small)." if too_small else "(destination capacity unknown)."),
+                               sev, m.start(), m.end(),
+                               {"suggestion":"Use AFLE-safe type (e.g., DDIC amount or P LENGTH 23 DECIMALS 2)."})
+            findings.append(usage)
+            _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
+                               usage["line"], decl_index, units, mirror_buckets, too_small)
+
+    # 4) Old move length conflict (assignment =)
     for m in ASSIGNMENT.finditer(src):
         dest, src_exp = m.group(1), m.group(2)
         if is_amount_like(symtab, src_exp):
             cshort = char_too_short(symtab, dest)
             dshort = dec_too_short(symtab, dest)
-            if cshort is True or dshort is True:
-                findings.append(pack_issue(unit, "OldMoveLengthConflict",
-                                           f"Assignment from amount into too-small {dest}.",
-                                           "error", m.start(), m.end(),
-                                           {"suggestion":"Widen {dest} to AFLE-safe amount type."}))
-            elif cshort is None and dshort is None:
-                findings.append(pack_issue(unit, "OldMoveLengthConflict",
-                                           f"Assignment from amount into {dest} (type unknown).",
-                                           "warning", m.start(), m.end(),
-                                           {"suggestion":"Ensure {dest} supports AFLE; adjust DDIC or helper var."}))
+            too_small = (cshort is True) or (dshort is True)
+            sev = "error" if too_small else "warning"
+            usage = pack_issue(unit, "OldMoveLengthConflict",
+                               f"Assignment from amount into {dest} " + ("(too small)." if too_small else "(type unknown)."),
+                               sev, m.start(), m.end(),
+                               {"suggestion":"Ensure destination is AFLE-safe (≥23,2) or adjust DDIC element."})
+            findings.append(usage)
+            _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
+                               usage["line"], decl_index, units, mirror_buckets, too_small)
 
-    # 1) & 5) Compare length conflict
+    # 1) & 5) Compare length conflicts
     for m in IF_BLOCK.finditer(src):
         cond = m.group(1)
         for c in SIMPLE_CMP.finditer(cond):
@@ -376,29 +622,38 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
             other = right if left_is_amt else left
             cshort = char_too_short(symtab, other) if not is_lit else None
             dshort = dec_too_short(symtab, other) if not is_lit else None
-            sev = "warning" if is_lit else ("error" if (cshort is True or dshort is True) else "info")
+            too_small = (cshort is True) or (dshort is True)
+            sev = "warning" if is_lit else ("error" if too_small else "info")
             msg = "Comparison between amount and literal." if is_lit else \
-                  ("Comparison with amount and short variable." if (cshort is True or dshort is True) else "Comparison with amount; verify other side length.")
-            findings.append(pack_issue(unit, "CompareLengthConflict", msg, sev, m.start(), m.end(),
-                                       {"suggestion":"Ensure both sides handle AFLE (widen short side / safe cast)."}))
+                  ("Comparison with amount and short variable." if too_small else "Comparison with amount; verify other side length.")
+            usage = pack_issue(unit, "CompareLengthConflict", msg, sev, m.start(), m.end(),
+                               {"suggestion":"Ensure both sides support AFLE (widen short side / safe cast)."})
+            findings.append(usage)
+            if not is_lit and re.match(r"^[A-Za-z_]\w*$", other or ""):
+                _emit_decl_mirrors(other, usage["issue_type"], usage["severity"], unit,
+                                   usage["line"], decl_index, units, mirror_buckets, too_small)
 
     # Open SQL INTO
     for m in SELECT_INTO.finditer(src):
         dest = m.group(2)
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
-        if cshort is True or dshort is True:
-            findings.append(pack_issue(unit, "OpenSQLTypeConflict",
-                                       f"SELECT INTO {dest} may overflow/truncate AFLE amounts.",
-                                       "error", m.start(), m.end(),
-                                       {"suggestion":"Align {dest} to DB field type (AFLE-compliant).",
-                                        "category":"Type conflicts in Open SQL"}))
-        elif cshort is None and dshort is None:
-            findings.append(pack_issue(unit, "OpenSQLTypeConflict",
-                                       f"SELECT INTO {dest} with unknown destination capacity.",
-                                       "info", m.start(), m.end(),
-                                       {"suggestion":"Verify destination vs DB; use AFLE-compliant type.",
-                                        "category":"Type conflicts in Open SQL"}))
+        too_small = (cshort is True) or (dshort is True)
+        if too_small:
+            usage = pack_issue(unit, "OpenSQLTypeConflict",
+                               f"SELECT INTO {dest} may overflow/truncate AFLE amounts.",
+                               "error", m.start(), m.end(),
+                               {"suggestion":"Align {dest} to DB field type (AFLE-compliant).",
+                                "category":"Type conflicts in Open SQL"})
+        else:
+            usage = pack_issue(unit, "OpenSQLTypeConflict",
+                               f"SELECT INTO {dest} with unknown destination capacity.",
+                               "info", m.start(), m.end(),
+                               {"suggestion":"Verify destination vs DB; use AFLE-compliant type.",
+                                "category":"Type conflicts in Open SQL"})
+        findings.append(usage)
+        _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
+                           usage["line"], decl_index, units, mirror_buckets, too_small)
 
     # LOOP/READ INTO
     loop_read = re.compile(r"\b(LOOP\s+AT|READ\s+TABLE)\b.+\bINTO\b\s+(\w+)", re.IGNORECASE)
@@ -406,12 +661,16 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         wa = m.group(2)
         cshort = char_too_short(symtab, wa)
         dshort = dec_too_short(symtab, wa)
-        if cshort is True or dshort is True:
-            findings.append(pack_issue(unit, "LoopReadTypeConflict",
-                                       f"Work area {wa} may be too small for AFLE amounts in row.",
-                                       "error", m.start(), m.end(),
-                                       {"suggestion":"Adjust work area to AFLE-compliant lengths.",
-                                        "category":"Type conflicts in LOOP/READ"}))
+        too_small = (cshort is True) or (dshort is True)
+        if too_small:
+            usage = pack_issue(unit, "LoopReadTypeConflict",
+                               f"Work area {wa} may be too small for AFLE amounts in row.",
+                               "error", m.start(), m.end(),
+                               {"suggestion":"Adjust work area to AFLE-compliant lengths.",
+                                "category":"Type conflicts in LOOP/READ"})
+            findings.append(usage)
+            _emit_decl_mirrors(wa, usage["issue_type"], usage["severity"], unit,
+                               usage["line"], decl_index, units, mirror_buckets, too_small)
 
     # MOVE-CORRESPONDING
     for m in MOVE_CORRESP.finditer(src):
@@ -437,7 +696,7 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
                                        {"suggestion":"Increase target CHAR length (≥25) or format properly.",
                                         "category":"WRITE TO"}))
 
-    # Floating-point / **
+    # Floating point / exponentiation
     for m in FLOAT_TYPES_DECL.finditer(src):
         findings.append(pack_issue(unit, "FloatingArithmeticRisk",
                                    "Arithmetic with F/DECFLOAT16 may round long amounts.",
@@ -500,32 +759,52 @@ def scan_unit(unit: Unit, symtab: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
     res = unit.model_dump()
     res["amount_findings"] = findings
-    # annotate scanner mode for transparency
     res["_scanner_mode"] = {
-        "online_enabled": ddic.online_enabled,
-        "http_client": None if _http_impl is None else _http_impl.__name__,
-        "catalog_loaded": bool(DDIC_CATALOG is not None)
+        "sap_online": sap.enabled,
+        "tavily_online": tav.enabled,
+        "http_client": None if _http is None else _http.__name__
     }
     return res
 
+# =========================
+# Orchestrator
+# =========================
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
+    # 1) build symbol table from all sources (multi-line aware)
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
-    return [scan_unit(u, symtab) for u in units]
+    # 2) build declaration index (multi-line aware, line-accurate)
+    decl_index = build_declaration_index(units)
+    # 3) scan each unit; collect declaration mirrors per target unit
+    mirror_buckets: MirrorBucket = {}
+    results = []
+    for idx, u in enumerate(units):
+        results.append(scan_unit(idx, u, symtab, decl_index, units, mirror_buckets))
+    # 4) inject declaration-site mirrors into the corresponding units’ findings
+    for uidx, mirrors in mirror_buckets.items():
+        if not mirrors:
+            continue
+        if uidx < len(results):
+            results[uidx].setdefault("amount_findings", []).extend(mirrors)
+    return results
 
-# ---------- API ----------
-app = FastAPI(title="Amount Field Scanner (AFLE) via OData DDIC — offline-capable", version="1.1")
-
+# =========================
+# API
+# =========================
 @app.post("/scan-amount")
 def scan_amount(units: List[Unit]):
-    # No connectivity probe—always proceed
     return analyze_units(units)
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "online_enabled": ddic.online_enabled,
-        "http_client": None if _http_impl is None else _http_impl.__name__,
-        "catalog_loaded": bool(DDIC_CATALOG is not None)
+        "sap_online": sap.enabled,
+        "tavily_online": tav.enabled,
+        "http_client": None if _http is None else _http.__name__
     }
+
+# To run:
+# pip install fastapi uvicorn requests  # or httpx
+# export TAVILY_API_KEY="your_tavily_key"  # optional, but recommended
+# uvicorn app_amount_scan_webaware_decl_multiline:app --host 0.0.0.0 --port 8046
