@@ -741,9 +741,6 @@ def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
 # =========================
 # API
 # =========================
-@app.post("/scan-amount")
-async def scan_amount(units: List[Unit]):
-    return analyze_units(units)
 
 @app.post("/scan-amount")
 async def scan_amount(units: List[Unit]):
