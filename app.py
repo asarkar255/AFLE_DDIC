@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
 import os, re
-
+import time
+from datetime import datetime
 # HTTP client placeholder (kept to preserve _scanner_mode/health structure)
 _http = None
 
@@ -744,20 +745,20 @@ def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
 async def scan_amount(units: List[Unit]):
     return analyze_units(units)
 
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "sap_online": False,
-        "tavily_online": False,
-        "http_client": None if _http is None else _http.__name__,
-        "thresholds": {
-            "MIN_CHAR_FOR_AMOUNT": MIN_CHAR_FOR_AMOUNT,
-            "MIN_DIGITS_FOR_AMOUNT": MIN_DIGITS_FOR_AMOUNT,
-            "DEFAULT_DECIMALS": DEFAULT_DECIMALS,
-            "SUPPRESS_UNKNOWN": SUPPRESS_UNKNOWN,
-        }
-    }
+@app.post("/scan-amount")
+async def scan_amount(units: List[Unit]):
+    start_ts = datetime.utcnow().isoformat() + "Z"
+    t0 = time.perf_counter()
+
+    results = analyze_units(units)
+
+    elapsed = time.perf_counter() - t0
+    end_ts = datetime.utcnow().isoformat() + "Z"
+
+    # Just print to server logs
+    print(f"[SCAN-AMOUNT] Start: {start_ts}, End: {end_ts}, Elapsed: {elapsed:.6f} sec")
+
+    return results
 
 # To run:
 # pip install fastapi uvicorn
