@@ -9,19 +9,19 @@ from pathlib import Path
 # =========================
 # Config (env)
 # =========================
-MIN_CHAR_FOR_AMOUNT       = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))   # suggested char width for formatted amounts
-MIN_DIGITS_FOR_AMOUNT     = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23")) # total digits to be AFLE-safe
-DEFAULT_DECIMALS          = int(os.getenv("DEFAULT_DECIMALS", "2"))
-SUPPRESS_UNKNOWN          = os.getenv("SUPPRESS_UNKNOWN", "true").lower() == "true"  # keep false when testing
-ENABLE_GENERIC_WRITE_HINTS= os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
-DDIC_PATH                 = os.getenv("DDIC_PATH", "ddic.json")
+MIN_CHAR_FOR_AMOUNT    = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))   # suggested char width for formatted amounts
+MIN_DIGITS_FOR_AMOUNT  = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23")) # P/DEC total length to be AFLE-safe
+DEFAULT_DECIMALS       = int(os.getenv("DEFAULT_DECIMALS", "2"))       # assume 2 decimals if unknown
+SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
+ENABLE_GENERIC_WRITE_HINTS = os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
+DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 
 # =========================
 # App
 # =========================
 app = FastAPI(
     title="Amount Field Scanner (AFLE) — OFFLINE JSON DDIC",
-    version="2.1"
+    version="2.0"
 )
 
 # =========================
@@ -40,20 +40,6 @@ class Unit(BaseModel):
 # =========================
 # Offline DDIC registry
 # =========================
-def _coerce_int(x):
-    if x is None:
-        return None
-    if isinstance(x, int):
-        return x
-    s = str(x).strip()
-    if not s:
-        return None
-    # strip leading zeros safely
-    try:
-        return int(s, 10)
-    except Exception:
-        return None
-
 class DDICRegistry:
     def __init__(self, path: str):
         self.de: Dict[str, Dict[str, Any]] = {}
@@ -65,17 +51,9 @@ class DDICRegistry:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             for k, v in (data.get("data_elements") or {}).items():
-                self.de[k.upper()] = {
-                    "len": _coerce_int(v.get("len")),
-                    "dec": _coerce_int(v.get("dec")),
-                    "source": "json_de"
-                }
+                self.de[k.upper()] = {"len": v.get("len"), "dec": v.get("dec"), "source": "json_de"}
             for k, v in (data.get("table_fields") or {}).items():
-                self.tf[k.upper()] = {
-                    "len": _coerce_int(v.get("len")),
-                    "dec": _coerce_int(v.get("dec")),
-                    "source": "json_tf"
-                }
+                self.tf[k.upper()] = {"len": v.get("len"), "dec": v.get("dec"), "source": "json_tf"}
             print(f"[DDIC] Loaded {len(self.de)} data elements, {len(self.tf)} table fields from {path}")
         except Exception as e:
             print(f"[DDIC] ERROR loading {path}: {e}")
@@ -219,12 +197,12 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
 # Symbol table & lookups (offline only)
 # =========================
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json (no name heuristics)."""
+    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex hints."""
     if not token:
         return None
     t = token.strip().upper()
 
-    # Table-field like BSEG-DMBTR
+    # Table-field like BSEG-DMBTR?
     if "-" in t:
         parts = t.split("-")
         if len(parts) == 2:
@@ -236,7 +214,7 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
             return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
         return None
 
-    # Data element like DMBTR
+    # Data element like DMBTR?
     de = DDIC.data_element(t)
     if de:
         kind = "amount" if de.get("dec") is not None else "char"
@@ -244,35 +222,23 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
     return None
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Map 'var' -> {'kind': 'char'|'packed'|'dec'|'amount', 'len': int|None, 'dec': int|None, 'ddic': '...'}
-    IMPORTANT: Treat P/DEC LENGTH as total digits (simple/consistent for AFLE scan).
-    """
     st: Dict[str, Dict[str, Any]] = {}
     for stmt, _, _ in iter_statements_with_offsets(full_src):
         s = stmt.strip()
         if not s:
             continue
-
         m = DECL_CHAR_LEN_PAREN.search(s)
-        if m:
-            st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
+        if m: st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
         m = DECL_CHAR_LEN_EXPL.search(s)
-        if m:
-            st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
-
+        if m: st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
         m = DECL_PACKED.search(s)
         if m:
-            ln = int(m.group(4)) if m.group(4) else None
-            dc = int(m.group(6)) if m.group(6) else None
-            st[m.group(2).lower()] = {"kind":"packed","len":ln,"dec":dc}
-
+            st[m.group(2).lower()] = {"kind":"packed","len":int(m.group(4)) if m.group(4) else None,
+                                      "dec":int(m.group(6)) if m.group(6) else None}
         m = DECL_DEC_TYPE.search(s)
         if m:
-            ln = int(m.group(4)) if m.group(4) else None
-            dc = int(m.group(6)) if m.group(6) else None
-            st[m.group(2).lower()] = {"kind":"dec","len":ln,"dec":dc}
-
+            st[m.group(2).lower()] = {"kind":"dec","len":int(m.group(4)) if m.group(4) else None,
+                                      "dec":int(m.group(6)) if m.group(6) else None}
         m = DECL_TYPE_GENERIC.search(s)
         if m:
             var, de = m.group(2).lower(), m.group(3)
@@ -296,7 +262,6 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
         src = u.code or ""
         for stmt, s_off, _ in iter_statements_with_offsets(src):
             stripped = stmt.strip()
-
             for pat in DECL_LINE_PATTERNS:
                 m = pat.match(stripped)
                 if m:
@@ -305,7 +270,6 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
                     if var:
                         index.setdefault(var, []).append(DeclSite(var, uidx, line_of_offset(src, s_off), stripped))
                     break
-
             mcol = DECL_HEADER_COLON.match(stripped)
             if not mcol:
                 continue
@@ -344,18 +308,6 @@ def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
             return True
     return False  # no heuristics
 
-def _digits_capacity(info: Optional[Dict[str, Any]]) -> Optional[int]:
-    """
-    Interpret stored 'len' as total digits for packed/dec/amount.
-    (Deliberately *not* converting ABAP P bytes -> digits; we keep it simple/consistent for AFLE.)
-    """
-    if not info:
-        return None
-    if info.get("kind") in {"packed","dec","amount"}:
-        ln = info.get("len")
-        return ln if isinstance(ln, int) else None
-    return None
-
 def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int = MIN_CHAR_FOR_AMOUNT) -> Optional[bool]:
     dd = ddic_lookup_token(token)
     if dd and dd["kind"] == "char":
@@ -369,17 +321,15 @@ def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int =
     return False
 
 def dec_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_digits: int = MIN_DIGITS_FOR_AMOUNT) -> Optional[bool]:
-    # Check DDIC tab-field or data element
     dd = ddic_lookup_token(token)
     if dd and dd["kind"] in {"amount","dec","packed"}:
-        cap = dd.get("len") or 0
-        return (cap < min_digits) if cap else None
-    # Check local var
+        ln = dd.get("len") or 0
+        return (ln < min_digits) if ln else None
     info = symtab.get((token or "").lower())
     if not info: return None
     if info["kind"] in {"packed","dec","amount"}:
-        cap = _digits_capacity(info) or 0
-        return (cap < min_digits) if cap else None
+        ln = info.get("len") or 0
+        return (ln < min_digits) if ln else None
     return False
 
 class MirrorBucket(Dict[int, List[Dict[str, Any]]]): pass
@@ -589,7 +539,7 @@ def scan_unit(unit_idx: int,
             _emit_decl_mirrors(wa, usage["issue_type"], usage["severity"], unit,
                                usage["line"], decl_index, units, mirror_buckets, True)
 
-    # MOVE-CORRESPONDING (generic)
+    # MOVE-CORRESPONDING (keep generic)
     for m in MOVE_CORRESP.finditer(src):
         findings.append(pack_issue(unit, "MoveCorrespondingRisk",
                                    "MOVE-CORRESPONDING may map extended amount to short field.",
@@ -700,6 +650,10 @@ def scan_unit(unit_idx: int,
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
+    print("SYM:", {k: v for k, v in symtab.items() if k in ["lv_salary", "bseg-dmbtr", "bseg", "dmbtr"]})
+    # after: symtab = build_symbol_table(flat_src)
+    print("DEBUG_SYMTAB:", {k: v for k, v in symtab.items() if k.lower() in ["lv_salary"]})
+
     decl_index = build_declaration_index(units)
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
