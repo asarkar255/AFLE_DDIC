@@ -651,6 +651,9 @@ def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
     print("SYM:", {k: v for k, v in symtab.items() if k in ["lv_salary", "bseg-dmbtr", "bseg", "dmbtr"]})
+    # after: symtab = build_symbol_table(flat_src)
+    print("DEBUG_SYMTAB:", {k: v for k, v in symtab.items() if k.lower() in ["lv_salary"]})
+
     decl_index = build_declaration_index(units)
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
