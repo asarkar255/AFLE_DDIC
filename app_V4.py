@@ -1,28 +1,25 @@
-# app_amount_scan_offline.py
+# app_amount_scan_webaware_decl_multiline.py (v1.6)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
-import os, re, json, time
+import os, re
+import time
 from datetime import datetime
-from pathlib import Path
+# HTTP client placeholder (kept to preserve _scanner_mode/health structure)
+_http = None
+
+app = FastAPI(
+    title="Amount Field Scanner (AFLE) — reduced false positives, decl mirrors, multiline decls",
+    version="1.6"
+)
 
 # =========================
-# Config (env)
+# Tunables (env-controlled)
 # =========================
 MIN_CHAR_FOR_AMOUNT    = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))   # suggested char width for formatted amounts
 MIN_DIGITS_FOR_AMOUNT  = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23")) # P/DEC total length to be AFLE-safe
 DEFAULT_DECIMALS       = int(os.getenv("DEFAULT_DECIMALS", "2"))       # assume 2 decimals if unknown
-SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "true").lower() == "true"
-ENABLE_GENERIC_WRITE_HINTS = os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
-DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
-
-# =========================
-# App
-# =========================
-app = FastAPI(
-    title="Amount Field Scanner (AFLE) — OFFLINE JSON DDIC",
-    version="2.0"
-)
+SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 
 # =========================
 # Models
@@ -38,41 +35,7 @@ class Unit(BaseModel):
     code: str
 
 # =========================
-# Offline DDIC registry
-# =========================
-class DDICRegistry:
-    def __init__(self, path: str):
-        self.de: Dict[str, Dict[str, Any]] = {}
-        self.tf: Dict[str, Dict[str, Any]] = {}
-        p = Path(path)
-        if not p.exists():
-            print(f"[DDIC] WARNING: {path} not found. All lookups will be unknown.")
-            return
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            for k, v in (data.get("data_elements") or {}).items():
-                self.de[k.upper()] = {"len": v.get("len"), "dec": v.get("dec"), "source": "json_de"}
-            for k, v in (data.get("table_fields") or {}).items():
-                self.tf[k.upper()] = {"len": v.get("len"), "dec": v.get("dec"), "source": "json_tf"}
-            print(f"[DDIC] Loaded {len(self.de)} data elements, {len(self.tf)} table fields from {path}")
-        except Exception as e:
-            print(f"[DDIC] ERROR loading {path}: {e}")
-
-    def data_element(self, name: str) -> Optional[Dict[str, Any]]:
-        if not name:
-            return None
-        return self.de.get(name.upper())
-
-    def table_field(self, tab: str, fld: str) -> Optional[Dict[str, Any]]:
-        if not tab or not fld:
-            return None
-        key = f"{tab}-{fld}".upper()
-        return self.tf.get(key)
-
-DDIC = DDICRegistry(DDIC_PATH)
-
-# =========================
-# Regexes (scanner)
+# Regexes (AFLE scanning)
 # =========================
 DECL_CHAR_LEN_PAREN = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*\((\d+)\)\s*TYPE\s*C\b", re.IGNORECASE)
 DECL_CHAR_LEN_EXPL  = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s*C\b[^.\n]*?\bLENGTH\b\s*(\d+)", re.IGNORECASE)
@@ -82,6 +45,8 @@ DECL_TYPE_GENERIC   = re.compile(r"\b(DATA|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\
 
 ASSIGNMENT          = re.compile(r"\b(\w+)\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
 MOVE_STMT           = re.compile(r"\bMOVE\b\s+(.+?)\s+\bTO\b\s+(\w+)\s*\.", re.IGNORECASE)
+
+# SELECT: capture select list (group 1) and INTO dest (group 2)
 SELECT_INTO         = re.compile(r"\bSELECT\b\s*(.+?)\bINTO\b\s+@?(\w+)\b", re.IGNORECASE | re.DOTALL)
 
 IF_BLOCK            = re.compile(r"\bIF\b\s+(.+?)\.\s*", re.IGNORECASE | re.DOTALL)
@@ -102,29 +67,39 @@ I_ACCEPT_PADDING    = re.compile(r"I_ACCEPT_PADDING\s*=\s*'X'", re.IGNORECASE)
 CDS_CAST_DEC        = re.compile(r"\bcast\s*\([^)]+as\s+abap\.(?:dec|curr)\s*\(\s*\d+\s*,\s*\d+\s*\)\s*\)", re.IGNORECASE)
 CDS_UNION           = re.compile(r"\bselect\b.+\bunion\b", re.IGNORECASE | re.DOTALL)
 
+# Heuristic amount field names
+AMOUNT_NAME_HINT    = re.compile(r"\b(dmbtr|wrbtr|bapicurr|betrag|amount|amt|kbetr|netwr|mwskz)\b", re.IGNORECASE)
+
+# For declaration indexing (line-by-line single-entry)
 DECL_LINE_PATTERNS = [
     re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s*:\s*(\w+)\b.*\.\s*$", re.IGNORECASE),
     re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s+(\w+)\b.*\.\s*$", re.IGNORECASE),
     re.compile(r"^\s*FIELD-SYMBOLS\s*<(\w+)>\b.*\.\s*$", re.IGNORECASE),
 ]
 
+# --- Multi-line colon-style declarations ---
 def iter_statements_with_offsets(src: str):
-    buf = []; start_off = 0
+    """Yield (statement_text, start_offset, end_offset) for each '.'-terminated statement."""
+    buf = []
+    start_off = 0
     for i, ch in enumerate(src):
         buf.append(ch)
         if ch == ".":
             stmt = "".join(buf)
             yield stmt, start_off, i + 1
-            buf = []; start_off = i + 1
+            buf = []
+            start_off = i + 1
     if buf:
         yield "".join(buf), start_off, len(src)
 
 def smart_split_commas(s: str):
+    """Split a multi-declaration body by commas, respecting quotes."""
     parts, cur, q, i = [], [], False, 0
     while i < len(s):
         c = s[i]
         if c == "'":
-            q = not q; cur.append(c)
+            q = not q
+            cur.append(c)
         elif c == "," and not q:
             parts.append("".join(cur).strip()); cur = []
         else:
@@ -137,12 +112,13 @@ def smart_split_commas(s: str):
 DECL_HEADER_COLON = re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
 DECL_ENTRY = re.compile(
-    r"^\s*(?P<var>\w+)\s*(?:"
-    r"TYPE\s+(?P<dtype>\w+)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?"
-    r"|LIKE\s+(?P<like>\w+)"
-    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"
-    r")?",
-    re.IGNORECASE
+    r"^\s*(?P<var>\w+)\s*(?:"                         # name
+    r"TYPE\s+(?P<dtype>\w+)"                          # TYPE DTYPE
+    r"(?:\s+LENGTH\s+(?P<len>\d+))?"                  # optional LENGTH
+    r"(?:\s+DECIMALS\s+(?P<dec>\d+))?"                # optional DECIMALS
+    r"|LIKE\s+(?P<like>\w+)"                          # OR LIKE ref
+    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"               # OR (n) TYPE C
+    r")?", re.IGNORECASE
 )
 
 # =========================
@@ -194,10 +170,23 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
     }
 
 # =========================
-# Symbol table & lookups (offline only)
+# Resolvers: stubs (SAP/Tavily removed)
+# =========================
+class _NullResolver:
+    enabled = False
+    def data_element(self, *args, **kwargs) -> Optional[Dict[str, Any]]:
+        return None
+    def table_field(self, *args, **kwargs) -> Optional[Dict[str, Any]]:
+        return None
+
+sap = _NullResolver()
+tav = _NullResolver()
+
+# =========================
+# Symbol table & lookups
 # =========================
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex hints."""
+    """Try to classify token via DDIC stubs; fallback to name-hint."""
     if not token:
         return None
     t = token.strip().upper()
@@ -207,19 +196,24 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
         parts = t.split("-")
         if len(parts) == 2:
             tab, fld = parts[0], parts[1]
-            tf = DDIC.table_field(tab, fld)
-            if tf is None:
-                return None
-            kind = "amount" if tf.get("dec") is not None else "char"
-            return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+            tf = sap.table_field(tab, fld) or tav.table_field(tab, fld)
+            if tf:
+                kind = "amount" if tf.get("dec") is not None else "char"
+                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+            if AMOUNT_NAME_HINT.search(fld):
+                return {"len": None, "dec": None, "kind": "amount", "source": "regex_name_hint"}
         return None
 
     # Data element like DMBTR?
-    de = DDIC.data_element(t)
+    de = sap.data_element(t) or tav.data_element(t)
     if de:
         kind = "amount" if de.get("dec") is not None else "char"
         return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source")}
+    if AMOUNT_NAME_HINT.search(t):
+        return {"len": None, "dec": None, "kind": "amount", "source": "regex_name_hint"}
     return None
+
+DECL_SPLIT = re.compile(r"\.", re.DOTALL)
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
     st: Dict[str, Dict[str, Any]] = {}
@@ -227,6 +221,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
         s = stmt.strip()
         if not s:
             continue
+        # single-line patterns
         m = DECL_CHAR_LEN_PAREN.search(s)
         if m: st[m.group(2).lower()] = {"kind":"char","len":int(m.group(3))}
         m = DECL_CHAR_LEN_EXPL.search(s)
@@ -246,15 +241,49 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
             if info:
                 st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
                            "len": info["len"], "dec": info["dec"], "ddic": de}
+        # multi-line colon header
+        mcol = DECL_HEADER_COLON.match(s)
+        if not mcol:
+            continue
+        body = mcol.group(2)
+        if body.endswith("."):
+            body = body[:-1]
+        for ent in smart_split_commas(body):
+            em = DECL_ENTRY.match(ent)
+            if not em:
+                continue
+            var = (em.group("var") or "").lower()
+            if not var:
+                continue
+            if em.group("charlen"):
+                st[var] = {"kind":"char","len":int(em.group("charlen"))}
+                continue
+            dtype = (em.group("dtype") or "").upper()
+            if dtype in {"P","DEC"}:
+                ln = int(em.group("len")) if em.group("len") else None
+                dc = int(em.group("dec")) if em.group("dec") else None
+                st[var] = {"kind":"packed" if dtype=="P" else "dec","len":ln,"dec":dc}
+                continue
+            ddic = (em.group("dtype") or em.group("like"))
+            if ddic:
+                info = ddic_lookup_token(ddic)
+                if info:
+                    st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
+                               "len": info["len"], "dec": info["dec"], "ddic": ddic}
+                else:
+                    st.setdefault(var, {"kind":"char","len":None,"ddic":ddic})
     return st
 
 # =========================
-# Declaration index
+# Declaration index (cross-include, multi-line aware)
 # =========================
 class DeclSite:
     __slots__ = ("var","unit_idx","line","text")
     def __init__(self, var: str, unit_idx: int, line: int, text: str):
-        self.var = var; self.unit_idx = unit_idx; self.line = line; self.text = text
+        self.var = var
+        self.unit_idx = unit_idx
+        self.line = line
+        self.text = text
 
 def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
     index: Dict[str, List[DeclSite]] = {}
@@ -262,39 +291,49 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
         src = u.code or ""
         for stmt, s_off, _ in iter_statements_with_offsets(src):
             stripped = stmt.strip()
+            # single-line patterns
             for pat in DECL_LINE_PATTERNS:
                 m = pat.match(stripped)
                 if m:
-                    var = (m.group(1) if pat.pattern.startswith(r"^\s*FIELD-SYMBOLS") else m.group(2)) or ""
-                    var = var.lower()
+                    if pat.pattern.startswith(r"^\s*FIELD-SYMBOLS"):
+                        var = (m.group(1) or "").lower()
+                    else:
+                        var = (m.group(2) or "").lower()
                     if var:
                         index.setdefault(var, []).append(DeclSite(var, uidx, line_of_offset(src, s_off), stripped))
                     break
+            # multi-line colon block
             mcol = DECL_HEADER_COLON.match(stripped)
             if not mcol:
                 continue
             body = mcol.group(2)
-            if body.endswith("."): body = body[:-1]
+            if body.endswith("."):
+                body = body[:-1]
             entries = smart_split_commas(body)
+            # offset where 'body' starts inside 'stmt'
             body_rel_off = stripped.find(body)
             stmt_abs_start = s_off + (len(stmt) - len(stripped))
             rel = 0
             for ent in entries:
-                if not ent: continue
+                if not ent:
+                    continue
                 subpos = body.find(ent, rel)
-                if subpos < 0: subpos = rel
+                if subpos < 0:
+                    subpos = rel
                 ent_abs_off = stmt_abs_start + body_rel_off + subpos
                 rel = subpos + len(ent)
                 em = DECL_ENTRY.match(ent)
-                if not em: continue
+                if not em:
+                    continue
                 var = (em.group("var") or "").lower()
-                if not var: continue
+                if not var:
+                    continue
                 line_no = line_of_offset(src, ent_abs_off)
                 index.setdefault(var, []).append(DeclSite(var, uidx, line_no, ent.strip()))
     return index
 
 # =========================
-# AFLE helpers
+# AFLE sizing helpers
 # =========================
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
     expr = (expr or "").strip()
@@ -306,7 +345,7 @@ def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
         info = symtab.get(mv.group(1).lower())
         if info and info["kind"] in {"amount","packed","dec"}:
             return True
-    return False  # no heuristics
+    return bool(AMOUNT_NAME_HINT.search(expr))
 
 def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int = MIN_CHAR_FOR_AMOUNT) -> Optional[bool]:
     dd = ddic_lookup_token(token)
@@ -332,7 +371,14 @@ def dec_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_digits: int
         return (ln < min_digits) if ln else None
     return False
 
-class MirrorBucket(Dict[int, List[Dict[str, Any]]]): pass
+def _safe_severity_for_unknown():
+    return "info" if SUPPRESS_UNKNOWN else "info"
+
+# =========================
+# Declaration mirrors
+# =========================
+class MirrorBucket(Dict[int, List[Dict[str, Any]]]):
+    pass
 
 def _emit_decl_mirrors(dest_token: str,
                        usage_issue_type: str,
@@ -348,6 +394,7 @@ def _emit_decl_mirrors(dest_token: str,
     decls = decl_index.get(dest_token.lower()) or []
     if not decls:
         return
+    # Only mirror when too_small is True, or (unknown and not suppressed)
     if too_small is None and SUPPRESS_UNKNOWN:
         return
     for d in decls:
@@ -359,7 +406,7 @@ def _emit_decl_mirrors(dest_token: str,
             itype = "DeclarationAFLESizeRisk"
         else:
             msg = f"Declaration of '{dest_token}' may be insufficient for AFLE amounts used in {usage_unit.inc_name}/{usage_unit.name} at line {usage_line} (destination capacity unknown)."
-            sev = "info"
+            sev = _safe_severity_for_unknown()
             sug = "Verify declared type supports AFLE (≥23,2) or adjust DDIC element."
             itype = "DeclarationAFLECapacityUnknown"
         mirror = pack_decl_issue(
@@ -373,18 +420,26 @@ def _emit_decl_mirrors(dest_token: str,
         )
         mirror_buckets.setdefault(d.unit_idx, []).append(mirror)
 
+# =========================
+# Scanner (with decl-site mirrors)
+# =========================
 def _select_list_has_amounts(select_list: str, symtab: Dict[str, Dict[str, Any]]) -> bool:
+    """
+    Reduce false positives: only treat SELECT as amount-relevant if the select list
+    includes any amount-like token (by name hint or DDIC).
+    """
     if not select_list:
         return False
+    # quick screen by keyword
+    if AMOUNT_NAME_HINT.search(select_list):
+        return True
+    # try to find tokens like tab-field or bare names
     tokens = re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", select_list)
     for t in tokens:
         if is_amount_like(symtab, t):
             return True
     return False
 
-# =========================
-# Scanner
-# =========================
 def scan_unit(unit_idx: int,
               unit: Unit,
               symtab: Dict[str, Dict[str, Any]],
@@ -394,10 +449,14 @@ def scan_unit(unit_idx: int,
     src = unit.code or ""
     findings: List[Dict[str, Any]] = []
 
-    # Concatenation / string ops (only if an amount-like token is present)
+    # 2) Concatenation — keep, but only when amount actually present
     for m in CONCATENATE_STMT.finditer(src):
         seg = m.group(0)
-        any_amount = any(is_amount_like(symtab, t) for t in re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", seg))
+        any_amount = False
+        for t in re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", seg):
+            if is_amount_like(symtab, t):
+                any_amount = True
+                break
         if any_amount:
             findings.append(pack_issue(unit, "ConcatenationDetected",
                                        "Amount used in CONCATENATE; string ops ignore scale/precision.",
@@ -411,13 +470,13 @@ def scan_unit(unit_idx: int,
                                        "warning", m.start(), m.end(),
                                        {"suggestion":"Avoid string ops with amounts; use formatting."}))
     for m in STRING_TEMPLATE.finditer(src):
-        if any(is_amount_like(symtab, t) for t in re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", m.group(0))):
+        if is_amount_like(symtab, m.group(0)):
             findings.append(pack_issue(unit, "ConcatenationDetected",
                                        "Amount used in string template.",
                                        "info", m.start(), m.end(),
                                        {"suggestion":"Templates OK for UI; avoid persisting templates."}))
 
-    # Offset/length slicing
+    # 3) Offset/length
     for m in OFFSET_LEN.finditer(src):
         var, off, ln = m.group(1), int(m.group(2)), int(m.group(3))
         if is_amount_like(symtab, var):
@@ -426,7 +485,7 @@ def scan_unit(unit_idx: int,
                                        "warning", m.start(), m.end(),
                                        {"suggestion":"Do not slice amounts; use numeric ops/formatting."}))
 
-    # MOVE ... TO ...
+    # 4) Old move length conflict (MOVE ... TO ...)
     for m in MOVE_STMT.finditer(src):
         src_exp, dest = m.group(1).strip(), m.group(2)
         if not is_amount_like(symtab, src_exp):
@@ -434,7 +493,15 @@ def scan_unit(unit_idx: int,
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
         too_small = (cshort is True) or (dshort is True)
-        sev = "error" if too_small else (None if SUPPRESS_UNKNOWN else "info")
+        if too_small:
+            sev = "error"
+        elif (cshort is None and dshort is None):
+            if SUPPRESS_UNKNOWN:
+                sev = None  # suppress
+            else:
+                sev = "info"
+        else:
+            sev = None  # destination is adequate or not char/dec
         if sev:
             usage = pack_issue(unit, "OldMoveLengthConflict",
                                f"Moving amount into {dest} " + ("(too small)." if too_small else "(destination capacity unknown)."),
@@ -442,9 +509,9 @@ def scan_unit(unit_idx: int,
                                {"suggestion":"Use AFLE-safe type (e.g., P LENGTH 23 DECIMALS 2 or DDIC amount)."})
             findings.append(usage)
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
-                               usage["line"], decl_index, units, mirror_buckets, True if too_small else None)
+                               usage["line"], decl_index, units, mirror_buckets, too_small if sev != "info" else None)
 
-    # Assignment =
+    # 4) Old move length conflict (= assignment)
     for m in ASSIGNMENT.finditer(src):
         dest, src_exp = m.group(1), m.group(2)
         if not is_amount_like(symtab, src_exp):
@@ -452,7 +519,15 @@ def scan_unit(unit_idx: int,
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
         too_small = (cshort is True) or (dshort is True)
-        sev = "error" if too_small else (None if SUPPRESS_UNKNOWN else "info")
+        if too_small:
+            sev = "error"
+        elif (cshort is None and dshort is None):
+            if SUPPRESS_UNKNOWN:
+                sev = None
+            else:
+                sev = "info"
+        else:
+            sev = None
         if sev:
             usage = pack_issue(unit, "OldMoveLengthConflict",
                                f"Assignment from amount into {dest} " + ("(too small)." if too_small else "(type unknown)."),
@@ -460,49 +535,51 @@ def scan_unit(unit_idx: int,
                                {"suggestion":"Ensure destination is AFLE-safe (≥23,2) or adjust DDIC element."})
             findings.append(usage)
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
-                               usage["line"], decl_index, units, mirror_buckets, True if too_small else None)
+                               usage["line"], decl_index, units, mirror_buckets, too_small if sev != "info" else None)
 
-    # IF comparisons
+    # 1) & 5) Compare length conflicts — only when other side is too small or literal (low sev)
     for m in IF_BLOCK.finditer(src):
         cond = m.group(1)
         for c in SIMPLE_CMP.finditer(cond):
-            left, _, right = c.group(1), c.group(2), c.group(3)
+            left, op, right = c.group(1), c.group(2), c.group(3)
             left_is_amt  = is_amount_like(symtab, left)
             right_is_amt = is_amount_like(symtab, right)
             if not (left_is_amt or right_is_amt):
                 continue
-            is_lit = bool(re.match(r"^'.*'$", right)) or right.replace(".","",1).isdigit() \
-                     or bool(re.match(r"^'.*'$", left))  or left.replace(".","",1).isdigit()
+            is_lit_token = lambda s: bool(re.match(r"^'.*'$", s)) or s.replace(".","",1).isdigit()
             other = right if left_is_amt else left
-            if is_lit:
+            if is_lit_token(other):
+                # Literal compare -> informational only
                 findings.append(pack_issue(unit, "CompareLengthConflict",
                                            "Comparison between amount and literal.",
                                            "info", m.start(), m.end(),
-                                           {"suggestion":"Ensure literal semantics are intended; prefer numeric compares."}))
+                                           {"suggestion":"Ensure literal semantics are intended; prefer comparing normalized numerics."}))
                 continue
+            # variable compare
             cshort = char_too_short(symtab, other)
             dshort = dec_too_short(symtab, other)
             too_small = (cshort is True) or (dshort is True)
             if too_small:
+                sev = "error"
                 usage = pack_issue(unit, "CompareLengthConflict",
                                    "Comparison with amount and short variable.",
-                                   "error", m.start(), m.end(),
-                                   {"suggestion":"Widen non-amount side to AFLE-safe length or normalize both sides."})
+                                   sev, m.start(), m.end(),
+                                   {"suggestion":"Widen the non-amount/short side to AFLE-safe length or normalize both sides."})
                 findings.append(usage)
-                if re.match(r"^[A-Za-z_]\w*$", other or ""):
-                    _emit_decl_mirrors(other, usage["issue_type"], usage["severity"], unit,
-                                       usage["line"], decl_index, units, mirror_buckets, True)
+                _emit_decl_mirrors(other, usage["issue_type"], usage["severity"], unit,
+                                   usage["line"], decl_index, units, mirror_buckets, True)
             elif (cshort is None and dshort is None) and not SUPPRESS_UNKNOWN:
                 findings.append(pack_issue(unit, "CompareLengthConflict",
                                            "Comparison with amount; other side capacity unknown.",
                                            "info", m.start(), m.end(),
                                            {"suggestion":"Verify the other side supports AFLE (≥23,2)."}))
 
-    # SELECT ... INTO (only if select list has amount-like tokens)
+    # Open SQL INTO — only if select list contains amount-like fields
     for m in SELECT_INTO.finditer(src):
-        select_list = m.group(1); dest = m.group(2)
+        select_list = m.group(1)
+        dest = m.group(2)
         if not _select_list_has_amounts(select_list, symtab):
-            continue
+            continue  # not an amount-relevant SELECT
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
         too_small = (cshort is True) or (dshort is True)
@@ -510,7 +587,7 @@ def scan_unit(unit_idx: int,
             usage = pack_issue(unit, "OpenSQLTypeConflict",
                                f"SELECT list includes amounts; destination {dest} may overflow/truncate.",
                                "error", m.start(), m.end(),
-                               {"suggestion":"Align destination to DB field type (AFLE-compliant P/DEC).",
+                               {"suggestion":"Align {dest} to DB field type (AFLE-compliant P/DEC).",
                                 "category":"Type conflicts in Open SQL"})
             findings.append(usage)
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
@@ -522,7 +599,7 @@ def scan_unit(unit_idx: int,
                                        {"suggestion":"Verify destination vs DB; use AFLE-compliant type.",
                                         "category":"Type conflicts in Open SQL"}))
 
-    # LOOP/READ INTO (flag only if WA known short numeric)
+    # LOOP/READ INTO — unchanged logic but only mirror when too_small
     loop_read = re.compile(r"\b(LOOP\s+AT|READ\s+TABLE)\b.+\bINTO\b\s+(\w+)", re.IGNORECASE)
     for m in loop_read.finditer(src):
         wa = m.group(2)
@@ -539,22 +616,20 @@ def scan_unit(unit_idx: int,
             _emit_decl_mirrors(wa, usage["issue_type"], usage["severity"], unit,
                                usage["line"], decl_index, units, mirror_buckets, True)
 
-    # MOVE-CORRESPONDING (keep generic)
+    # MOVE-CORRESPONDING — keep as warning
     for m in MOVE_CORRESP.finditer(src):
         findings.append(pack_issue(unit, "MoveCorrespondingRisk",
                                    "MOVE-CORRESPONDING may map extended amount to short field.",
                                    "warning", m.start(), m.end(),
                                    {"suggestion":"Align structures or use CORRESPONDING #( ... MAPPING ... )."}))
 
-    # WRITE (generic hint optional)
-    if ENABLE_GENERIC_WRITE_HINTS:
-        for m in WRITE_STMT.finditer(src):
-            findings.append(pack_issue(unit, "ListWriteLayoutRisk",
-                                       "WRITE list output may misalign due to AFLE output length.",
-                                       "info", m.start(), m.end(),
-                                       {"suggestion":"Specify explicit (len) or shift columns for classic lists.",
-                                        "category":"WRITE statements (list output)"}))
-    # WRITE TO <target> — check only target length
+    # WRITE / WRITE TO — unchanged
+    for m in WRITE_STMT.finditer(src):
+        findings.append(pack_issue(unit, "ListWriteLayoutRisk",
+                                   "WRITE list output may misalign due to AFLE output length.",
+                                   "info", m.start(), m.end(),
+                                   {"suggestion":"Specify explicit (len) or shift columns for classic lists.",
+                                    "category":"WRITE statements (list output)"}))
     for m in WRITE_TO_STMT.finditer(src):
         target = m.group(2)
         cshort = char_too_short(symtab, target, min_len=MIN_CHAR_FOR_AMOUNT)
@@ -562,10 +637,10 @@ def scan_unit(unit_idx: int,
             findings.append(pack_issue(unit, "WriteToTruncationRisk",
                                        f"WRITE TO target {target} may truncate AFLE amounts.",
                                        "error", m.start(), m.end(),
-                                       {"suggestion":f"Increase target CHAR length (≥{MIN_CHAR_FOR_AMOUNT}) or format properly.",
+                                       {"suggestion":"Increase target CHAR length (≥{MIN_CHAR_FOR_AMOUNT}) or format properly.",
                                         "category":"WRITE TO"}))
 
-    # Floating/exponent (advisory)
+    # Floating-point / exponentiation
     for m in FLOAT_TYPES_DECL.finditer(src):
         findings.append(pack_issue(unit, "FloatingArithmeticRisk",
                                    "Arithmetic with F/DECFLOAT16 may round long amounts.",
@@ -612,7 +687,7 @@ def scan_unit(unit_idx: int,
                                        {"suggestion":"Pass I_ACCEPT_PADDING = 'X' for pre-AFLE extracts.",
                                         "category":"ALV extracts"}))
 
-    # CDS/AMDP
+    # CDS/AMDP hints
     for m in CDS_CAST_DEC.finditer(src):
         findings.append(pack_issue(unit, "CDSCastLengthCheck",
                                    "CDS cast to abap.dec/curr with explicit length: verify AFLE-compliant length.",
@@ -631,16 +706,13 @@ def scan_unit(unit_idx: int,
     res["_scanner_mode"] = {
         "sap_online": False,
         "tavily_online": False,
-        "http_client": None,
+        "http_client": None if _http is None else _http.__name__,
         "thresholds": {
             "MIN_CHAR_FOR_AMOUNT": MIN_CHAR_FOR_AMOUNT,
             "MIN_DIGITS_FOR_AMOUNT": MIN_DIGITS_FOR_AMOUNT,
             "DEFAULT_DECIMALS": DEFAULT_DECIMALS,
             "SUPPRESS_UNKNOWN": SUPPRESS_UNKNOWN,
-            "ENABLE_GENERIC_WRITE_HINTS": ENABLE_GENERIC_WRITE_HINTS,
-        },
-        "ddic_path": str(DDIC_PATH),
-        "ddic_loaded": True if (DDIC.de or DDIC.tf) else False
+        }
     }
     return res
 
@@ -648,44 +720,43 @@ def scan_unit(unit_idx: int,
 # Orchestrator
 # =========================
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
+    # 1) build symbol table from all sources (multi-line aware)
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
+    # 2) build declaration index (multi-line aware, line-accurate)
     decl_index = build_declaration_index(units)
+    # 3) scan each unit; collect declaration mirrors per target unit
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
     for idx, u in enumerate(units):
         results.append(scan_unit(idx, u, symtab, decl_index, units, mirror_buckets))
+    # 4) inject declaration-site mirrors into the corresponding units’ findings
     for uidx, mirrors in mirror_buckets.items():
-        if mirrors and uidx < len(results):
+        if not mirrors:
+            continue
+        if uidx < len(results):
             results[uidx].setdefault("amount_findings", []).extend(mirrors)
     return results
 
 # =========================
 # API
 # =========================
+
 @app.post("/scan-amount")
 async def scan_amount(units: List[Unit]):
     start_ts = datetime.utcnow().isoformat() + "Z"
     t0 = time.perf_counter()
+
     results = analyze_units(units)
+
     elapsed = time.perf_counter() - t0
     end_ts = datetime.utcnow().isoformat() + "Z"
-    # Print timing only (not in response)
-    print(f"[SCAN-AMOUNT] Start={start_ts} End={end_ts} Elapsed={elapsed:.6f}s Units={len(units)} DDIC={DDIC_PATH}")
+
+    # Just print to server logs
+    print(f"[SCAN-AMOUNT] Start: {start_ts}, End: {end_ts}, Elapsed: {elapsed:.6f} sec")
+
     return results
 
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "ddic_loaded": True if (DDIC.de or DDIC.tf) else False,
-        "ddic_path": str(DDIC_PATH),
-        "counts": {"data_elements": len(DDIC.de), "table_fields": len(DDIC.tf)},
-        "thresholds": {
-            "MIN_CHAR_FOR_AMOUNT": MIN_CHAR_FOR_AMOUNT,
-            "MIN_DIGITS_FOR_AMOUNT": MIN_DIGITS_FOR_AMOUNT,
-            "DEFAULT_DECIMALS": DEFAULT_DECIMALS,
-            "SUPPRESS_UNKNOWN": SUPPRESS_UNKNOWN,
-            "ENABLE_GENERIC_WRITE_HINTS": ENABLE_GENERIC_WRITE_HINTS,
-        }
-    }
+# To run:
+# pip install fastapi uvicorn
+# uvicorn app_amount_scan_webaware_decl_multiline:app --host 0.0.0.0 --port 8046
