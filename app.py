@@ -12,7 +12,7 @@ from pathlib import Path
 MIN_CHAR_FOR_AMOUNT    = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))   # suggested char width for formatted amounts
 MIN_DIGITS_FOR_AMOUNT  = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23")) # P/DEC total length to be AFLE-safe
 DEFAULT_DECIMALS       = int(os.getenv("DEFAULT_DECIMALS", "2"))       # assume 2 decimals if unknown
-SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "true").lower() == "true"
+SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 ENABLE_GENERIC_WRITE_HINTS = os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
 DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 
@@ -650,6 +650,7 @@ def scan_unit(unit_idx: int,
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
+    print("SYM:", {k: v for k, v in symtab.items() if k in ["lv_salary", "bseg-dmbtr", "bseg", "dmbtr"]})
     decl_index = build_declaration_index(units)
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
