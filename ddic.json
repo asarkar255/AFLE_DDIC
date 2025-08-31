@@ -9,6 +9,14 @@
     "BSEG-DMBTR": {
       "len": "23",
       "dec": "2"
+    },
+     "RTAX1U15-WMWST": {
+      "len": "23",
+      "dec": "2"
+    },
+     "RTAX1U15-MSATZ": {
+      "len": "23",
+      "dec": "2"
     }
-  }
+  }  
 }
