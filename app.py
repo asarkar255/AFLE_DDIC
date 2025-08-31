@@ -1,4 +1,4 @@
-# app_amount_scan_offline.py  (v2.4 – struct BEGIN/END tolerant; INCLUDE resolution; legacy P/C; hyphen tokens)
+# app_amount_scan_offline.py  (v2.5 – struct BEGIN/END tolerant; INCLUDE resolution; colon-style decls; legacy P/C; hyphen tokens)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -21,7 +21,7 @@ DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 # =========================
 app = FastAPI(
     title="Amount Field Scanner (AFLE) — OFFLINE JSON DDIC",
-    version="2.4"
+    version="2.5"
 )
 
 # =========================
@@ -126,6 +126,29 @@ DECL_LINE_PATTERNS = [
     re.compile(r"^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s+(\w+)\b.*\.\s*$", re.IGNORECASE),
     re.compile(r"^\s*FIELD-SYMBOLS\s*<(\w+)>\b.*\.\s*$", re.IGNORECASE),
 ]
+
+# --- Colon-style header (single or multi-entry) ---
+DECL_HEADER_COLON = re.compile(
+    r"""(?imxs)
+    ^\s*
+    (DATA|STATICS|CONSTANTS|PARAMETERS)      # header
+    \s*:\s*
+    (?P<body>                                # capture body up to the statement-ending dot
+        .*?
+    )
+    \.\s*(?:\"[^\n]*)?$                      # terminating dot (+ optional EOL comment)
+    """
+)
+
+# --- Entry grammar shared by colon-style and single-line ---
+DECL_ENTRY = re.compile(
+    r"^\s*(?P<var>\w+)\s*(?:"
+    r"TYPE\s+(?P<dtype>\w+)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?"
+    r"|LIKE\s+(?P<like>\w+)"
+    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"
+    r")?",
+    re.IGNORECASE
+)
 
 # --- FIX: Structure blocks — accept END OF with or without 'DATA:'; tolerate comma/newlines after BEGIN OF <name> ---
 STRUCT_BLOCK_RE = re.compile(
@@ -317,7 +340,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
         if not s:
             continue
 
-        mcol = DECL_HEADER_COLON.match(s) if 'DECL_HEADER_COLON' in globals() else None
+        mcol = DECL_HEADER_COLON.match(s)
         if mcol:
             body = mcol.group("body")
             for ent in parse_colon_body_entries(body):
