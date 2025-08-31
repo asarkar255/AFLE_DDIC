@@ -1,4 +1,4 @@
-# app_amount_scan_offline.py
+# app_amount_scan_offline.py  (v2.2 – struct components + hyphen tokens + legacy P/C)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -12,7 +12,7 @@ from pathlib import Path
 MIN_CHAR_FOR_AMOUNT    = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))   # suggested char width for formatted amounts
 MIN_DIGITS_FOR_AMOUNT  = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23")) # P/DEC total length to be AFLE-safe
 DEFAULT_DECIMALS       = int(os.getenv("DEFAULT_DECIMALS", "2"))       # assume 2 decimals if unknown
-SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "true").lower() == "true"
+SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 ENABLE_GENERIC_WRITE_HINTS = os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
 DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 
@@ -21,7 +21,7 @@ DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 # =========================
 app = FastAPI(
     title="Amount Field Scanner (AFLE) — OFFLINE JSON DDIC",
-    version="2.1"
+    version="2.2"
 )
 
 # =========================
@@ -89,8 +89,11 @@ DECL_PACKED         = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]
 DECL_DEC_TYPE       = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+DEC\b[^.\n]*?(LENGTH\s+(\d+))?[^.\n]*?(DECIMALS\s+(\d+))?", re.IGNORECASE)
 DECL_TYPE_GENERIC   = re.compile(r"\b(DATA|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+(\w+)\b", re.IGNORECASE)
 
-ASSIGNMENT          = re.compile(r"\b(\w+)\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
-MOVE_STMT           = re.compile(r"\bMOVE\b\s+(.+?)\s+\bTO\b\s+(\w+)\s*\.", re.IGNORECASE)
+# Token that supports component names (STRUCT-FIELD) or plain VAR
+TOKEN = r"[A-Za-z_]\w*(?:-[A-Za-z_]\w+)?"
+
+ASSIGNMENT          = re.compile(rf"\b({TOKEN})\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
+MOVE_STMT           = re.compile(rf"\bMOVE\b\s+(.+?)\s+\bTO\b\s+({TOKEN})\s*\.", re.IGNORECASE)
 SELECT_INTO         = re.compile(r"\bSELECT\b\s*(.+?)\bINTO\b\s+@?(\w+)\b", re.IGNORECASE | re.DOTALL)
 
 IF_BLOCK            = re.compile(r"\bIF\b\s+(.+?)\.\s*", re.IGNORECASE | re.DOTALL)
@@ -99,7 +102,7 @@ SIMPLE_CMP          = re.compile(r"(\w+)\s*(=|<>|NE|EQ|LT|LE|GT|GE)\s*('?[\w\.\-
 CONCATENATE_STMT    = re.compile(r"\bCONCATENATE\b(.+?)\bINTO\b", re.IGNORECASE | re.DOTALL)
 STRING_OP_AND       = re.compile(r"(.+?)\s*&&\s*(.+?)")
 STRING_TEMPLATE     = re.compile(r"\|.*?\{[^}]*\}\|", re.IGNORECASE | re.DOTALL)
-OFFSET_LEN          = re.compile(r"\b(\w+(?:-\w+)?)\s*\+\s*(\d+)\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
+OFFSET_LEN          = re.compile(rf"\b({TOKEN})\s*\+\s*(\d+)\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
 WRITE_STMT          = re.compile(r"^\s*WRITE(\s*[:]?)(.+)", re.IGNORECASE | re.MULTILINE)
 WRITE_TO_STMT       = re.compile(r"\bWRITE\s+(.+?)\bTO\b\s+(\w+)\b", re.IGNORECASE)
 FLOAT_TYPES_DECL    = re.compile(r"\bTYPE\s+(F|DECFLOAT16)\b", re.IGNORECASE)
@@ -118,7 +121,7 @@ DECL_LINE_PATTERNS = [
     re.compile(r"^\s*FIELD-SYMBOLS\s*<(\w+)>\b.*\.\s*$", re.IGNORECASE),
 ]
 
-# --- Refactored: colon-style header (always parse, even single entry) ---
+# Colon-style header (single or multi-entry)
 DECL_HEADER_COLON = re.compile(
     r"""(?imxs)
     ^\s*
@@ -139,6 +142,12 @@ DECL_ENTRY = re.compile(
     r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"
     r")?",
     re.IGNORECASE
+)
+
+# Structure block: DATA: BEGIN OF s .... DATA: END OF s.
+STRUCT_BLOCK_RE = re.compile(
+    r"(?is)^\s*DATA\s*:\s*BEGIN\s+OF\s+(\w+)[^\.]*\.(.+?)^\s*DATA\s*:\s*END\s+OF\s+\1\s*\.",
+    re.MULTILINE
 )
 
 # =========================
@@ -232,7 +241,7 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
 # Symbol table & lookups (offline only)
 # =========================
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex hints."""
+    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex name-heuristics."""
     if not token:
         return None
     t = token.strip().upper()
@@ -256,10 +265,72 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
         return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source")}
     return None
 
+def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[str, Any]]):
+    """
+    Parse DATA: BEGIN OF <s>. ... DATA: END OF <s>. blocks and record component types:
+      - <name> LIKE tab-field
+      - <name>(n) TYPE p [DECIMALS d]
+      - <name> TYPE p [LENGTH n] [DECIMALS d]
+      - <name>(n) TYPE c
+    Keys are stored as "<struct>-<field>" in the symtab.
+    """
+    for sm in STRUCT_BLOCK_RE.finditer(full_src):
+        struct = (sm.group(1) or "").lower()
+        body   = sm.group(2) or ""
+        # split by commas/newlines while keeping simple lines
+        # allow both "A,\nB," and one-per-line
+        parts = re.split(r",\s*\n|\n", body)
+        for raw in parts:
+            ln = (raw or "").strip().rstrip(",.")
+            if not ln:
+                continue
+
+            # 1) field LIKE tab-field
+            m_like = re.search(r"^(\w+)\s+LIKE\s+([A-Za-z_]\w*)-([A-Za-z_]\w*)\b", ln, re.IGNORECASE)
+            if m_like:
+                fld = m_like.group(1).lower()
+                tab = m_like.group(2)
+                col = m_like.group(3)
+                info = DDIC.table_field(tab, col)
+                if info:
+                    kind = "amount" if info.get("dec") is not None else "char"
+                    st[f"{struct}-{fld}"] = {"kind": kind, "len": info.get("len"), "dec": info.get("dec")}
+                continue
+
+            # 2) legacy packed: field(n) TYPE p [DECIMALS d]
+            m_p_legacy = re.search(r"^(\w+)\s*\((\d+)\)\s*TYPE\s+p\b(?:\s+DECIMALS\s+(\d+))?", ln, re.IGNORECASE)
+            if m_p_legacy:
+                fld = m_p_legacy.group(1).lower()
+                ln_digits = int(m_p_legacy.group(2))
+                dec = int(m_p_legacy.group(3)) if m_p_legacy.group(3) else None
+                st[f"{struct}-{fld}"] = {"kind": "packed", "len": ln_digits, "dec": dec}
+                continue
+
+            # 3) normal packed: field TYPE p [LENGTH n] [DECIMALS d]
+            m_p = re.search(r"^(\w+)\s+TYPE\s+p\b(?:\s+LENGTH\s+(\d+))?(?:\s+DECIMALS\s+(\d+))?", ln, re.IGNORECASE)
+            if m_p:
+                fld = m_p.group(1).lower()
+                ln_digits_or_bytes = int(m_p.group(2)) if m_p.group(2) else None
+                dec = int(m_p.group(3)) if m_p.group(3) else None
+                st[f"{struct}-{fld}"] = {"kind": "packed", "len": ln_digits_or_bytes, "dec": dec}
+                continue
+
+            # 4) char legacy: field(n) TYPE c
+            m_c = re.search(r"^(\w+)\s*\((\d+)\)\s*TYPE\s+c\b", ln, re.IGNORECASE)
+            if m_c:
+                fld = m_c.group(1).lower()
+                ln_chars = int(m_c.group(2))
+                st[f"{struct}-{fld}"] = {"kind": "char", "len": ln_chars}
+                continue
+
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
-    """Colon-style first (single or multi entry), then fall back to single-line patterns."""
+    """Colon-style & structure-first (single or multi entry), then fall back to single-line patterns."""
     st: Dict[str, Dict[str, Any]] = {}
 
+    # --- 0) Structures: BEGIN/END OF (fills keys like struct-field) ---
+    _parse_structure_components_into_symtab(full_src, st)
+
+    # --- 1) Iterate statements for colon-style and single-line declarations ---
     for stmt, _, _ in iter_statements_with_offsets(full_src):
         s = stmt.strip()
         if not s:
@@ -409,14 +480,19 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
 # =========================
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
     expr = (expr or "").strip()
+
+    # DDIC lookup for explicit DE / TAB-FLD
     dd = ddic_lookup_token(expr)
     if dd and dd["kind"] == "amount":
         return True
-    mv = re.match(r"^(\w+)$", expr)
+
+    # Symbol-table lookup: VAR or STRUCT-FIELD
+    mv = re.match(rf"^({TOKEN})$", expr)
     if mv:
         info = symtab.get(mv.group(1).lower())
         if info and info["kind"] in {"amount","packed","dec"}:
             return True
+
     return False  # no heuristics
 
 def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int = MIN_CHAR_FOR_AMOUNT) -> Optional[bool]:
@@ -781,8 +857,7 @@ async def scan_amount(units: List[Unit]):
     results = analyze_units(units)
     elapsed = time.perf_counter() - t0
     end_ts = datetime.utcnow().isoformat() + "Z"
-    # Print timing only (not in response)
-    print(f"[SCAN-AMOUNT] Start={start_ts} End={end_ts} Elapsed={elapsed:.6f}s Units={len(units)} DDIC={DDIC_PATH}")
+    # print(f"[SCAN-AMOUNT] Start={start_ts} End={end_ts} Elapsed={elapsed:.6f}s Units={len(units)} DDIC={DDIC_PATH}")
     return results
 
 @app.get("/health")
