@@ -92,8 +92,20 @@ DECL_TYPE_GENERIC   = re.compile(r"\b(DATA|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\
 # Token that supports component names (STRUCT-FIELD) or plain VAR
 TOKEN = r"[A-Za-z_]\w*(?:-[A-Za-z_]\w+)?"
 
-ASSIGNMENT          = re.compile(rf"\b({TOKEN})\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
-MOVE_STMT           = re.compile(rf"\bMOVE\b\s+(.+?)\s+\bTO\b\s+({TOKEN})\s*\.", re.IGNORECASE)
+# ASSIGNMENT          = re.compile(rf"\b({TOKEN})\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
+# MOVE_STMT           = re.compile(rf"\bMOVE\b\s+(.+?)\s+\bTO\b\s+({TOKEN})\s*\.", re.IGNORECASE)
+# replace these two patterns in your script
+
+ASSIGNMENT  = re.compile(
+    r"\b([A-Za-z_]\w*(?:-[A-Za-z_]\w+)?)\s*=\s*([^\.\n]+)\.",
+    re.IGNORECASE
+)
+
+MOVE_STMT   = re.compile(
+    r"\bMOVE\b\s+(.+?)\s+\bTO\b\s+([A-Za-z_]\w*(?:-[A-Za-z_]\w+)?)\s*\.",
+    re.IGNORECASE
+)
+
 SELECT_INTO         = re.compile(r"\bSELECT\b\s*(.+?)\bINTO\b\s+@?(\w+)\b", re.IGNORECASE | re.DOTALL)
 
 IF_BLOCK            = re.compile(r"\bIF\b\s+(.+?)\.\s*", re.IGNORECASE | re.DOTALL)
