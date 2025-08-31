@@ -1,4 +1,4 @@
-# app_amount_scan_offline.py  (v2.3 – chained struct blocks + include mapping + normalization)
+# app_amount_scan_offline.py  (v2.3 – adds classic BEGIN/END parsing + struct components + hyphen tokens + legacy P/C)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -80,12 +80,6 @@ class DDICRegistry:
 DDIC = DDICRegistry(DDIC_PATH)
 
 # =========================
-# Globals (struct include mapping)
-# =========================
-# Map local struct (declared name) -> DDIC structure name (from INCLUDE STRUCTURE ...)
-STRUCT_INCLUDE_MAP: Dict[str, str] = {}
-
-# =========================
 # Regexes (scanner)
 # =========================
 # Single-line decls
@@ -149,40 +143,33 @@ DECL_HEADER_COLON = re.compile(
 
 # Entry grammar shared by colon-style and single-line
 DECL_ENTRY = re.compile(
-    r"^\s*(?P<var>\w+)\s*(?:"              # var
-    r"TYPE\s+(?P<dtype>\w+)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?"  # TYPE dtype [LENGTH n] [DECIMALS d]
-    r"|LIKE\s+(?P<like>\w+)"               # or LIKE de
-    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"    # or (n) TYPE C
+    r"^\s*(?P<var>\w+)\s*(?:"
+    r"TYPE\s+(?P<dtype>\w+)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?"
+    r"|LIKE\s+(?P<like>\w+)"
+    r"|\((?P<charlen>\d+)\)\s*TYPE\s*C"
     r")?",
     re.IGNORECASE
 )
 
-# Structure blocks (works with chained, comma-delimited DATA: statement)
+# Structure blocks:
+# 1) Chained style (commas), already supported in previous versions
 STRUCT_BLOCK_RE = re.compile(
+    r"(?is)^\s*DATA\s*:\s*BEGIN\s+OF\s+(\w+)[^\.]*\.(.+?)^\s*DATA\s*:\s*END\s+OF\s+\1\s*\.",
+    re.MULTILINE
+)
+# 2) Classic style with full stops on BEGIN/END lines (NEW)
+CLASSIC_STRUCT_BLOCK_RE = re.compile(
     r"""(?isx)
-    BEGIN \s+ OF \s+ (?P<name>\w+)      # BEGIN OF <name>
-    [^.,]*?                             # optional qualifiers (e.g., OCCURS 10)
-    ,                                   # chained: followed by a comma
-    (?P<body> .*?)                      # body until we hit END OF <name>
-    END \s+ OF \s+ (?P=name) \s* (?:,|\.)   # END OF <name> followed by comma or dot
-    """
+    ^\s*DATA\s*:\s*BEGIN\s+OF\s+(?P<name>\w+)[^.\n]*\.\s*   # 'DATA: BEGIN OF <name> ... .'
+    (?P<body> .*?)                                          # body (anything)
+    ^\s*DATA\s*:\s*END\s+OF\s+(?P=name)\s*\.\s*             # 'DATA: END OF <name>.'
+    """,
+    re.MULTILINE,
 )
 
 # =========================
 # Helpers
 # =========================
-def _normalize(src: str) -> str:
-    """Tame odd Unicode whitespace/line separators commonly found in pasted ABAP."""
-    if not src:
-        return src
-    return (src
-        .replace("\u2028", "\n")   # LINE SEPARATOR -> newline
-        .replace("\u2029", "\n")   # PARAGRAPH SEPARATOR -> newline
-        .replace("\u00A0", " ")    # NBSP -> space
-        .replace("\u2007", " ")    # figure space -> space
-        .replace("\u2060", " ")    # word joiner -> space
-    )
-
 def iter_statements_with_offsets(src: str):
     """Yield (statement_text, start_offset, end_offset) for each '.'-terminated statement."""
     buf = []; start_off = 0
@@ -271,54 +258,67 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
 # Symbol table & lookups (offline only)
 # =========================
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; include local-struct → DDIC mapping."""
+    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex name-heuristics."""
     if not token:
         return None
     t = token.strip().upper()
 
-    # Table-field like STRUCT-FLD or TAB-FLD
+    # Table-field like BSEG-DMBTR?
     if "-" in t:
-        left, right = t.split("-", 1)
-        # Map local struct name to DDIC structure if we have an INCLUDE STRUCTURE
-        mapped_struct = STRUCT_INCLUDE_MAP.get(left.lower())
-        key_left = mapped_struct if mapped_struct else left
-        tf = DDIC.table_field(key_left, right)
-        if tf is None:
-            return None
-        kind = "amount" if tf.get("dec") is not None else "char"
-        return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+        parts = t.split("-")
+        if len(parts) == 2:
+            tab, fld = parts[0], parts[1]
+            tf = DDIC.table_field(tab, fld)
+            if tf is None:
+                return None
+            kind = "amount" if tf.get("dec") is not None else "char"
+            return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+        return None
 
-    # Data element like DMBTR
+    # Data element like DMBTR?
     de = DDIC.data_element(t)
     if de:
         kind = "amount" if de.get("dec") is not None else "char"
         return {"len": de.get("len"), "dec": de.get("dec"), "kind": kind, "source": de.get("source")}
     return None
 
+# Tracks INCLUDE STRUCTURE <DDIC> for each local struct name
+STRUCT_INCLUDE_MAP: Dict[str, str] = {}
+
 def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[str, Any]]):
     """
-    Parse comma-chained structure blocks within colon-style or standalone statements.
-    - Records INCLUDE STRUCTURE mapping (STRUCT_INCLUDE_MAP[local] = DDIC struct)
-    - Stores component keys as "<struct>-<field>" in symtab with kind/len/dec
+    Parse structure blocks and record component types:
+      - <name> LIKE tab-field
+      - <name>(n) TYPE p [DECIMALS d]
+      - <name> TYPE p [LENGTH n] [DECIMALS d]
+      - <name>(n) TYPE c
+    Keys stored as "<struct>-<field>" in symtab.
+
+    Supports BOTH:
+      1) chained style:  DATA: BEGIN OF s , ... END OF s .
+      2) classic style:  DATA: BEGIN OF s . ... DATA: END OF s .
+
+    Also records INCLUDE STRUCTURE mapping so <local>-<comp> can be resolved to a DDIC struct if needed.
     """
-    # reset per analyze run
     STRUCT_INCLUDE_MAP.clear()
 
-    for sm in STRUCT_BLOCK_RE.finditer(full_src):
-        struct = (sm.group("name") or "").lower()
-        body   = sm.group("body") or ""
+    def _consume_match_struct_name_body(struct_name: str, body: str):
+        struct = (struct_name or "").lower()
+        body   = body or ""
 
-        # Record INCLUDE STRUCTURE (last wins if multiple)
+        # Normalize: drop leading inner "DATA:" prefixes that some styles use
+        body = re.sub(r"(?mi)^\s*DATA\s*:\s*", "", body)
+
+        # Capture INCLUDE STRUCTURE <DDIC>
         for inc in re.finditer(r"\bINCLUDE\s+STRUCTURE\s+(\w+)\b", body, re.IGNORECASE):
             STRUCT_INCLUDE_MAP[struct] = inc.group(1).upper()
 
-        # Split body into lines/components – tolerate commas/newlines
-        parts = re.split(r",\s*\n|\n|,", body)
-        for raw in parts:
+        # Split the body into candidate component lines by commas and/or newlines
+        for raw in re.split(r",\s*\n|\n|,", body):
             ln = (raw or "").strip().rstrip(",.")
             if not ln:
                 continue
-            # skip INCLUDE STRUCTURE lines (already captured)
+            # Skip INCLUDE STRUCTURE lines (already handled)
             if re.search(r"\bINCLUDE\s+STRUCTURE\b", ln, re.IGNORECASE):
                 continue
 
@@ -359,6 +359,18 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
                 ln_chars = int(m_c.group(2))
                 st[f"{struct}-{fld}"] = {"kind": "char", "len": ln_chars}
                 continue
+
+    # 1) old chained style
+    for m in STRUCT_BLOCK_RE.finditer(full_src):
+        name = m.group(1)
+        body = m.group(2)
+        _consume_match_struct_name_body(name, body)
+
+    # 2) classic style (NEW)
+    for m in CLASSIC_STRUCT_BLOCK_RE.finditer(full_src):
+        name = m.group("name")
+        body = m.group("body")
+        _consume_match_struct_name_body(name, body)
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
     """Colon-style & structure-first (single or multi entry), then fall back to single-line patterns."""
@@ -518,7 +530,7 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
     expr = (expr or "").strip()
 
-    # DDIC lookup for explicit DE / TAB-FLD (with include mapping)
+    # DDIC lookup for explicit DE / TAB-FLD
     dd = ddic_lookup_token(expr)
     if dd and dd["kind"] == "amount":
         return True
@@ -567,7 +579,6 @@ def _emit_decl_mirrors(dest_token: str,
                        units: List[Unit],
                        mirror_buckets: MirrorBucket,
                        too_small: Optional[bool]):
-    # Only mirror for simple vars (not struct-components)
     if not re.match(r"^[A-Za-z_]\w*$", dest_token or ""):
         return
     decls = decl_index.get(dest_token.lower()) or []
@@ -858,11 +869,11 @@ def scan_unit(unit_idx: int,
         "tavily_online": False,
         "http_client": None,
         "thresholds": {
-                "MIN_CHAR_FOR_AMOUNT": MIN_CHAR_FOR_AMOUNT,
-                "MIN_DIGITS_FOR_AMOUNT": MIN_DIGITS_FOR_AMOUNT,
-                "DEFAULT_DECIMALS": DEFAULT_DECIMALS,
-                "SUPPRESS_UNKNOWN": SUPPRESS_UNKNOWN,
-                "ENABLE_GENERIC_WRITE_HINTS": ENABLE_GENERIC_WRITE_HINTS,
+            "MIN_CHAR_FOR_AMOUNT": MIN_CHAR_FOR_AMOUNT,
+            "MIN_DIGITS_FOR_AMOUNT": MIN_DIGITS_FOR_AMOUNT,
+            "DEFAULT_DECIMALS": DEFAULT_DECIMALS,
+            "SUPPRESS_UNKNOWN": SUPPRESS_UNKNOWN,
+            "ENABLE_GENERIC_WRITE_HINTS": ENABLE_GENERIC_WRITE_HINTS,
         },
         "ddic_path": str(DDIC_PATH),
         "ddic_loaded": True if (DDIC.de or DDIC.tf) else False
@@ -873,21 +884,13 @@ def scan_unit(unit_idx: int,
 # Orchestrator
 # =========================
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
-    # Normalize code for all units (handles NBSP/Unicode line sep)
-    norm_units = []
-    for u in units:
-        d = u.model_dump()
-        d["code"] = _normalize(d.get("code") or "")
-        norm_units.append(Unit(**d))
-
-    flat_src = "\n".join(u.code or "" for u in norm_units)
+    flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
-    decl_index = build_declaration_index(norm_units)
-
+    decl_index = build_declaration_index(units)
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
-    for idx, u in enumerate(norm_units):
-        results.append(scan_unit(idx, u, symtab, decl_index, norm_units, mirror_buckets))
+    for idx, u in enumerate(units):
+        results.append(scan_unit(idx, u, symtab, decl_index, units, mirror_buckets))
     for uidx, mirrors in mirror_buckets.items():
         if mirrors and uidx < len(results):
             results[uidx].setdefault("amount_findings", []).extend(mirrors)
