@@ -1,4 +1,4 @@
-# app_amount_scan_offline.py  (v2.2 – struct components + hyphen tokens + legacy P/C)
+# app_amount_scan_offline.py  (v2.3 – struct components + hyphen tokens + legacy P/C + INCLUDE resolution)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -21,7 +21,7 @@ DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
 # =========================
 app = FastAPI(
     title="Amount Field Scanner (AFLE) — OFFLINE JSON DDIC",
-    version="2.2"
+    version="2.3"
 )
 
 # =========================
@@ -92,10 +92,6 @@ DECL_TYPE_GENERIC   = re.compile(r"\b(DATA|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\
 # Token that supports component names (STRUCT-FIELD) or plain VAR
 TOKEN = r"[A-Za-z_]\w*(?:-[A-Za-z_]\w+)?"
 
-# ASSIGNMENT          = re.compile(rf"\b({TOKEN})\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
-# MOVE_STMT           = re.compile(rf"\bMOVE\b\s+(.+?)\s+\bTO\b\s+({TOKEN})\s*\.", re.IGNORECASE)
-# replace these two patterns in your script
-
 ASSIGNMENT  = re.compile(
     r"\b([A-Za-z_]\w*(?:-[A-Za-z_]\w+)?)\s*=\s*([^\.\n]+)\.",
     re.IGNORECASE
@@ -156,9 +152,9 @@ DECL_ENTRY = re.compile(
     re.IGNORECASE
 )
 
-# Structure block: DATA: BEGIN OF s .... DATA: END OF s.
+# Structure block: tolerant of commas/newlines after "BEGIN OF <name>"
 STRUCT_BLOCK_RE = re.compile(
-    r"(?is)^\s*DATA\s*:\s*BEGIN\s+OF\s+(\w+)[^\.]*\.(.+?)^\s*DATA\s*:\s*END\s+OF\s+\1\s*\.",
+    r"(?is)^\s*DATA\s*:\s*BEGIN\s+OF\s*(?:\r?\n\s*)?(?P<name>\w+)[^\n]*\n(?P<body>.*?)^\s*DATA\s*:\s*END\s+OF\s+(?P=name)\s*\.",
     re.MULTILINE
 )
 
@@ -252,22 +248,30 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
 # =========================
 # Symbol table & lookups (offline only)
 # =========================
+# Map "variable struct name" -> "INCLUDE STRUCTURE <DDIC struct name>"
+STRUCT_INCLUDES: Dict[str, str] = {}   # lower(var) -> UPPER(included struct)
+
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; no regex name-heuristics."""
+    """Offline-only DDIC: recognize DE or TAB-FLD from ddic.json; also resolve var-field via INCLUDE STRUCTURE."""
     if not token:
         return None
     t = token.strip().upper()
 
-    # Table-field like BSEG-DMBTR?
+    # Table-field or variable-field (one hyphen)
     if "-" in t:
-        parts = t.split("-")
-        if len(parts) == 2:
-            tab, fld = parts[0], parts[1]
-            tf = DDIC.table_field(tab, fld)
-            if tf is None:
-                return None
+        a, b = t.split("-", 1)
+        # direct TF match
+        tf = DDIC.table_field(a, b)
+        if tf:
             kind = "amount" if tf.get("dec") is not None else "char"
             return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": tf.get("source")}
+        # resolve "var-field" via INCLUDE STRUCTURE
+        incl = STRUCT_INCLUDES.get(a.lower())
+        if incl:
+            tf = DDIC.table_field(incl, b)
+            if tf:
+                kind = "amount" if tf.get("dec") is not None else "char"
+                return {"len": tf.get("len"), "dec": tf.get("dec"), "kind": kind, "source": f"include:{incl}"}
         return None
 
     # Data element like DMBTR?
@@ -279,22 +283,27 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
 
 def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[str, Any]]):
     """
-    Parse DATA: BEGIN OF <s>. ... DATA: END OF <s>. blocks and record component types:
-      - <name> LIKE tab-field
-      - <name>(n) TYPE p [DECIMALS d]
-      - <name> TYPE p [LENGTH n] [DECIMALS d]
-      - <name>(n) TYPE c
+    Parse DATA: BEGIN OF <s>. ... DATA: END OF <s>. blocks and record:
+      - INCLUDE STRUCTURE <name>   (stored in STRUCT_INCLUDES)
+      - <field> LIKE tab-field     (DDIC lookup)
+      - <field>(n) TYPE p [DECIMALS d]
+      - <field> TYPE p [LENGTH n] [DECIMALS d]
+      - <field>(n) TYPE c
     Keys are stored as "<struct>-<field>" in the symtab.
     """
     for sm in STRUCT_BLOCK_RE.finditer(full_src):
-        struct = (sm.group(1) or "").lower()
-        body   = sm.group(2) or ""
-        # split by commas/newlines while keeping simple lines
-        # allow both "A,\nB," and one-per-line
+        struct = (sm.group("name") or "").lower()
+        body   = sm.group("body") or ""
+
+        # capture INCLUDE STRUCTURE
+        for inc in re.finditer(r"\bINCLUDE\s+STRUCTURE\s+(\w+)\b", body, re.IGNORECASE):
+            STRUCT_INCLUDES[struct] = inc.group(1).upper()
+
+        # split components on lines/commas
         parts = re.split(r",\s*\n|\n", body)
         for raw in parts:
             ln = (raw or "").strip().rstrip(",.")
-            if not ln:
+            if not ln or ln.upper().startswith("INCLUDE STRUCTURE"):
                 continue
 
             # 1) field LIKE tab-field
@@ -338,8 +347,10 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
     """Colon-style & structure-first (single or multi entry), then fall back to single-line patterns."""
     st: Dict[str, Dict[str, Any]] = {}
+    # reset include map each analysis
+    STRUCT_INCLUDES.clear()
 
-    # --- 0) Structures: BEGIN/END OF (fills keys like struct-field) ---
+    # --- 0) Structures: BEGIN/END OF (fills keys like struct-field + include map) ---
     _parse_structure_components_into_symtab(full_src, st)
 
     # --- 1) Iterate statements for colon-style and single-line declarations ---
