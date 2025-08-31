@@ -1,4 +1,4 @@
-# app_amount_scan_offline.py  (v2.3 – adds classic BEGIN/END parsing + struct components + hyphen tokens + legacy P/C)
+# app_amount_scan_offline.py  (v2.3 — classic BEGIN/END parsing + struct components + hyphen tokens + legacy P/C + SYMTAB debug)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -15,6 +15,13 @@ DEFAULT_DECIMALS       = int(os.getenv("DEFAULT_DECIMALS", "2"))       # assume 
 SUPPRESS_UNKNOWN       = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 ENABLE_GENERIC_WRITE_HINTS = os.getenv("ENABLE_GENERIC_WRITE_HINTS", "false").lower() == "true"
 DDIC_PATH              = os.getenv("DDIC_PATH", "ddic.json")
+
+# Debug toggle for symbol-table discovery
+DEBUG_SYMTAB = os.getenv("DEBUG_SYMTAB", "0").lower() not in ("0", "false", "no", "")
+
+def dbg(*args, **kwargs):
+    if DEBUG_SYMTAB:
+        print(*args, **kwargs)
 
 # =========================
 # App
@@ -152,17 +159,17 @@ DECL_ENTRY = re.compile(
 )
 
 # Structure blocks:
-# 1) Chained style (commas), already supported in previous versions
+# 1) Chained style (commas)
 STRUCT_BLOCK_RE = re.compile(
     r"(?is)^\s*DATA\s*:\s*BEGIN\s+OF\s+(\w+)[^\.]*\.(.+?)^\s*DATA\s*:\s*END\s+OF\s+\1\s*\.",
     re.MULTILINE
 )
-# 2) Classic style with full stops on BEGIN/END lines (NEW)
+# 2) Classic style with full stops on BEGIN/END lines
 CLASSIC_STRUCT_BLOCK_RE = re.compile(
     r"""(?isx)
-    ^\s*DATA\s*:\s*BEGIN\s+OF\s+(?P<name>\w+)[^.\n]*\.\s*   # 'DATA: BEGIN OF <name> ... .'
-    (?P<body> .*?)                                          # body (anything)
-    ^\s*DATA\s*:\s*END\s+OF\s+(?P=name)\s*\.\s*             # 'DATA: END OF <name>.'
+    ^\s*DATA\s*:\s*BEGIN\s+OF\s+(?P{name>\w+)[^.\n]*\.\s*
+    (?P<body> .*?)
+    ^\s*DATA\s*:\s*END\s+OF\s+(?P=name)\s*\.\s*
     """,
     re.MULTILINE,
 )
@@ -312,6 +319,7 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
         # Capture INCLUDE STRUCTURE <DDIC>
         for inc in re.finditer(r"\bINCLUDE\s+STRUCTURE\s+(\w+)\b", body, re.IGNORECASE):
             STRUCT_INCLUDE_MAP[struct] = inc.group(1).upper()
+            dbg(f"[SYMTAB] INCLUDE STRUCTURE: {struct} -> {STRUCT_INCLUDE_MAP[struct]}")
 
         # Split the body into candidate component lines by commas and/or newlines
         for raw in re.split(r",\s*\n|\n|,", body):
@@ -332,6 +340,7 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
                 if info:
                     kind = "amount" if info.get("dec") is not None else "char"
                     st[f"{struct}-{fld}"] = {"kind": kind, "len": info.get("len"), "dec": info.get("dec")}
+                    dbg(f"[SYMTAB] struct-comp LIKE: {struct}-{fld}  <- {tab}-{col}  => {st[f'{struct}-{fld}']}")
                 continue
 
             # 2) legacy packed: field(n) TYPE p [DECIMALS d]
@@ -341,6 +350,7 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
                 ln_digits = int(m_p_legacy.group(2))
                 dec = int(m_p_legacy.group(3)) if m_p_legacy.group(3) else None
                 st[f"{struct}-{fld}"] = {"kind": "packed", "len": ln_digits, "dec": dec}
+                dbg(f"[SYMTAB] struct-comp P(legacy): {struct}-{fld} => {st[f'{struct}-{fld}']}")
                 continue
 
             # 3) normal packed: field TYPE p [LENGTH n] [DECIMALS d]
@@ -350,6 +360,7 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
                 ln_digits_or_bytes = int(m_p.group(2)) if m_p.group(2) else None
                 dec = int(m_p.group(3)) if m_p.group(3) else None
                 st[f"{struct}-{fld}"] = {"kind": "packed", "len": ln_digits_or_bytes, "dec": dec}
+                dbg(f"[SYMTAB] struct-comp P: {struct}-{fld} => {st[f'{struct}-{fld}']}")
                 continue
 
             # 4) char legacy: field(n) TYPE c
@@ -358,18 +369,21 @@ def _parse_structure_components_into_symtab(full_src: str, st: Dict[str, Dict[st
                 fld = m_c.group(1).lower()
                 ln_chars = int(m_c.group(2))
                 st[f"{struct}-{fld}"] = {"kind": "char", "len": ln_chars}
+                dbg(f"[SYMTAB] struct-comp C: {struct}-{fld} => {st[f'{struct}-{fld}']}")
                 continue
 
-    # 1) old chained style
+    # 1) chained style
     for m in STRUCT_BLOCK_RE.finditer(full_src):
         name = m.group(1)
         body = m.group(2)
+        dbg(f"[SYMTAB] STRUCT (chained): {name}")
         _consume_match_struct_name_body(name, body)
 
-    # 2) classic style (NEW)
+    # 2) classic style
     for m in CLASSIC_STRUCT_BLOCK_RE.finditer(full_src):
         name = m.group("name")
         body = m.group("body")
+        dbg(f"[SYMTAB] STRUCT (classic): {name}")
         _consume_match_struct_name_body(name, body)
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
@@ -399,6 +413,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
 
                 if em.group("charlen"):
                     st[var] = {"kind": "char", "len": int(em.group("charlen"))}
+                    dbg(f"[SYMTAB] decl C: {var} => {st[var]}  (colon entry: {ent.strip()})")
                     continue
 
                 dtype = (em.group("dtype") or "").upper()
@@ -406,6 +421,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                     ln = int(em.group("len")) if em.group("len") else None
                     dc = int(em.group("dec")) if em.group("dec") else None
                     st[var] = {"kind": "packed" if dtype == "P" else "dec", "len": ln, "dec": dc}
+                    dbg(f"[SYMTAB] decl {dtype}: {var} => {st[var]}  (colon entry: {ent.strip()})")
                     continue
 
                 ddic = (em.group("dtype") or em.group("like"))
@@ -418,19 +434,23 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                             "dec": info["dec"],
                             "ddic": ddic,
                         }
+                        dbg(f"[SYMTAB] decl DDIC: {var} => {st[var]}  (from {ddic})")
                     else:
                         st.setdefault(var, {"kind": "char", "len": None, "ddic": ddic})
+                        dbg(f"[SYMTAB] decl DDIC-unknown: {var} => {st[var]}  (from {ddic})")
             continue
 
         # --- Non-colon single-line declarations ---
         m = DECL_CHAR_LEN_PAREN.search(s)
         if m:
             st[m.group(2).lower()] = {"kind": "char", "len": int(m.group(3))}
+            dbg(f"[SYMTAB] decl C(paren): {m.group(2).lower()} => {st[m.group(2).lower()]}  (stmt: {s.strip()})")
             continue
 
         m = DECL_CHAR_LEN_EXPL.search(s)
         if m:
             st[m.group(2).lower()] = {"kind": "char", "len": int(m.group(3))}
+            dbg(f"[SYMTAB] decl C(len): {m.group(2).lower()} => {st[m.group(2).lower()]}  (stmt: {s.strip()})")
             continue
 
         m = DECL_PACKED.search(s)
@@ -440,6 +460,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                 "len": int(m.group(4)) if m.group(4) else None,
                 "dec": int(m.group(6)) if m.group(6) else None,
             }
+            dbg(f"[SYMTAB] decl P: {m.group(2).lower()} => {st[m.group(2).lower()]}  (stmt: {s.strip()})")
             continue
 
         m = DECL_DEC_TYPE.search(s)
@@ -449,6 +470,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                 "len": int(m.group(4)) if m.group(4) else None,
                 "dec": int(m.group(6)) if m.group(6) else None,
             }
+            dbg(f"[SYMTAB] decl DEC: {m.group(2).lower()} => {st[m.group(2).lower()]}  (stmt: {s.strip()})")
             continue
 
         m = DECL_TYPE_GENERIC.search(s)
@@ -462,7 +484,9 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                     "dec": info["dec"],
                     "ddic": de,
                 }
+                dbg(f"[SYMTAB] decl TYPE {de}: {var} => {st[var]}")
 
+    dbg(f"[SYMTAB] built {len(st)} symbols: {sorted(st.keys())}")
     return st
 
 # =========================
@@ -886,6 +910,7 @@ def scan_unit(unit_idx: int,
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
+    dbg("[SYMTAB] analyze_units: symbol table ready")
     decl_index = build_declaration_index(units)
     mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
