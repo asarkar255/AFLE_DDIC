@@ -1,16 +1,12 @@
 # app_afle_amount_scan.py
 # Offline AFLE (SAP Note 2610650) amount scanner using ddic.json
-# - Detects assignments/moves/selects where amount-like fields (e.g., BSEG-DMBTR, RTAX1U15-WMWST)
-#   flow into too-short numeric/char destinations
-# - Resolves local structure components and INCLUDE STRUCTURE mappings
-# - Emits declaration-site mirrors so you can fix the declaration where it's defined
-#
-# Environment vars (optional):
-#   DDIC_PATH=ddic.json
-#   MIN_DIGITS_FOR_AMOUNT=23
-#   MIN_CHAR_FOR_AMOUNT=25
-#   SUPPRESS_UNKNOWN=false          (if true, suppress "unknown dest type" infos)
-#   DEBUG_SYMTAB=false              (if true, print the symbol table once per run)
+# Now supports structure blocks inside comma-terminated DATA lists:
+#   DATA:
+#     BEGIN OF s, ... field(n) TYPE p, ... END OF s,
+#     other_decl TYPE ...
+# Environment:
+#   DDIC_PATH=ddic.json, MIN_DIGITS_FOR_AMOUNT=23, MIN_CHAR_FOR_AMOUNT=25,
+#   SUPPRESS_UNKNOWN=false, DEBUG_SYMTAB=false
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -19,26 +15,15 @@ from pathlib import Path
 from datetime import datetime
 import os, json, re, time
 
-# =========================
-# Config (env)
-# =========================
 DDIC_PATH               = os.getenv("DDIC_PATH", "ddic.json")
 MIN_DIGITS_FOR_AMOUNT   = int(os.getenv("MIN_DIGITS_FOR_AMOUNT", "23"))
 MIN_CHAR_FOR_AMOUNT     = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))
 SUPPRESS_UNKNOWN        = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 DEBUG_SYMTAB            = os.getenv("DEBUG_SYMTAB", "false").lower() in {"1","true","yes","y"}
 
-# =========================
-# App
-# =========================
-app = FastAPI(
-    title="AFLE Amount Scanner (offline ddic.json)",
-    version="1.0"
-)
+app = FastAPI(title="AFLE Amount Scanner (offline ddic.json)", version="1.1")
 
-# =========================
-# Models
-# =========================
+# -------- Models --------
 class Finding(BaseModel):
     pgm_name: Optional[str] = None
     inc_name: Optional[str] = None
@@ -66,9 +51,7 @@ class Unit(BaseModel):
     code: str
     amount_findings: Optional[List[Finding]] = None  # output
 
-# =========================
-# Offline DDIC registry
-# =========================
+# -------- DDIC (offline) --------
 class DDICRegistry:
     def __init__(self, path: str):
         self.de: Dict[str, Dict[str, Any]] = {}
@@ -96,45 +79,32 @@ class DDICRegistry:
             print(f"[DDIC] ERROR loading {path}: {e}")
 
     def data_element(self, name: str) -> Optional[Dict[str, Any]]:
-        if not name: return None
-        return self.de.get(name.upper())
+        return self.de.get((name or "").upper())
 
     def table_field(self, tabfld: str) -> Optional[Dict[str, Any]]:
-        # tabfld must be "TAB-FLD" in uppercase (already combined)
-        if not tabfld: return None
-        return self.tf.get(tabfld.upper())
+        return self.tf.get((tabfld or "").upper())
 
 DDIC = DDICRegistry(DDIC_PATH)
 
-# =========================
-# Regexes (declarations & usage)
-# =========================
-# Tokens: VAR or STRUCT-FIELD
+# -------- Regexes --------
 TOKEN = r"[A-Za-z_]\w*(?:-[A-Za-z_]\w+)?"
 
-# --- Declarations (single-line) ---
+# Decls (single-line + colon-style)
 DECL_CHAR_LEN_PAREN = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*\((\d+)\)\s*TYPE\s*C\b", re.IGNORECASE)
 DECL_CHAR_LEN_EXPL  = re.compile(r"\b(DATA|CONSTANTS|FIELD-SYMBOLS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s*C\b[^.\n]*?\bLENGTH\b\s*(\d+)", re.IGNORECASE)
 DECL_PACKED         = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+P\b[^.\n]*?(?:LENGTH\s+(\d+))?[^.\n]*?(?:DECIMALS\s+(\d+))?", re.IGNORECASE)
 DECL_DEC_TYPE       = re.compile(r"\b(DATA|CONSTANTS|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s*TYPE\s+DEC\b[^.\n]*?(?:LENGTH\s+(\d+))?[^.\n]*?(?:DECIMALS\s+(\d+))?", re.IGNORECASE)
 DECL_TYPE_GENERIC   = re.compile(r"\b(DATA|PARAMETERS|STATICS)\b[^.\n]*?\b(\w+)\b\s+(?:TYPE|LIKE)\s+(\w+)\b", re.IGNORECASE)
 
-# --- Colon-style header + entries ---
-DECL_HEADER_COLON = re.compile(
-    r"""(?imxs)
-    ^\s*
-    (DATA|STATICS|CONSTANTS|PARAMETERS)
-    \s*:\s*
-    (?P<body> .*?)
-    \.\s*(?:\"[^\n]*)?$       # end at dot, optional eol comment
-    """
-)
+# Colon header + entries
+DECL_HEADER_COLON = re.compile(r"""(?imxs)^\s*(DATA|STATICS|CONSTANTS|PARAMETERS)\s*:\s*(?P<body>.*?)\.\s*(?:\"[^\n]*)?$""")
 DECL_ENTRY = re.compile(
     r"^\s*(?P<var>\w+)\s*(?:(?:TYPE|LIKE)\s+(?P<dtype>\w+(?:-\w+)?)(?:\s+LENGTH\s+(?P<len>\d+))?(?:\s+DECIMALS\s+(?P<dec>\d+))?|\((?P<charlen>\d+)\)\s*TYPE\s*C)?",
     re.IGNORECASE
 )
 
-# --- Structure blocks: chained and classic ---
+# Structure blocks:
+# 1) classic chained with dots
 STRUCT_BLOCK_RE = re.compile(
     r"""(?isx)
     ^\s*DATA\s*:\s*BEGIN\s+OF\s+(\w+)[^.\n]*\.\s*   # DATA: BEGIN OF s .
@@ -142,16 +112,25 @@ STRUCT_BLOCK_RE = re.compile(
     ^\s*DATA\s*:\s*END\s+OF\s+\1\s*\.\s*            # DATA: END OF s .
     """, re.MULTILINE
 )
-
+# 2) classic dotted 'BEGIN OF ... . ... END OF ... .' (anywhere)
 CLASSIC_STRUCT_BLOCK_RE = re.compile(
     r"""(?isx)
-    ^\s*DATA\s*:\s*BEGIN\s+OF\s+(?P<name>\w+)[^.\n]*\.\s*   # DATA: BEGIN OF <name>.
-    (?P<body> .*?)                                          # body
-    ^\s*DATA\s*:\s*END\s+OF\s+(?P=name)\s*\.\s*             # DATA: END OF <name>.
-    """, re.MULTILINE,
+    ^\s*BEGIN\s+OF\s+(?P<name>\w+)[^.\n]*\.\s*
+    (?P<body> .*?)
+    ^\s*END\s+OF\s+(?P=name)\s*\.\s*
+    """, re.MULTILINE
+)
+# 3) *** NEW *** data-list style with commas:
+#    BEGIN OF s, ... END OF s,
+DATA_LIST_STRUCT_RE = re.compile(
+    r"""(?isx)
+    ^\s*BEGIN\s+OF\s+(?P<name>\w+)[^,\n]*,\s*   # 'BEGIN OF name,' (comma)
+    (?P<body> .*?)
+    ^\s*END\s+OF\s+(?P=name)\s*,\s*             # 'END OF name,' (comma)
+    """, re.MULTILINE
 )
 
-# --- Usage patterns ---
+# Usage
 ASSIGNMENT  = re.compile(rf"\b({TOKEN})\s*=\s*([^\.\n]+)\.", re.IGNORECASE)
 MOVE_STMT   = re.compile(rf"\bMOVE\b\s+(.+?)\s+\bTO\b\s+({TOKEN})\s*\.", re.IGNORECASE)
 SELECT_INTO = re.compile(r"\bSELECT\b\s*(.+?)\bINTO\b\s+@?(\w+)\b", re.IGNORECASE | re.DOTALL)
@@ -161,15 +140,11 @@ SIMPLE_CMP  = re.compile(rf"({TOKEN})\s*(=|<>|NE|EQ|LT|LE|GT|GE)\s*('?[\w\.\-]+'
 CONCATENATE_STMT = re.compile(r"\bCONCATENATE\b(.+?)\bINTO\b", re.IGNORECASE | re.DOTALL)
 STRING_OP_AND    = re.compile(r"(.+?)\s*&&\s*(.+?)")
 STRING_TEMPLATE  = re.compile(r"\|.*?\{[^}]*\}\|", re.IGNORECASE | re.DOTALL)
-
 OFFSET_LEN       = re.compile(rf"\b({TOKEN})\s*\+\s*(\d+)\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
 WRITE_TO_STMT    = re.compile(r"\bWRITE\s+(.+?)\bTO\b\s+(\w+)\b", re.IGNORECASE)
 
-# =========================
-# Helpers
-# =========================
+# -------- Helpers --------
 def iter_statements_with_offsets(src: str):
-    """Yield (statement_text, start_offset, end_offset) for each '.'-terminated statement."""
     buf = []; start_off = 0
     for i, ch in enumerate(src):
         buf.append(ch)
@@ -189,8 +164,7 @@ def smart_split_commas(s: str) -> List[str]:
             parts.append("".join(cur).strip()); cur = []
         else:
             cur.append(ch)
-    if cur:
-        parts.append("".join(cur).strip())
+    if cur: parts.append("".join(cur).strip())
     return [p for p in parts if p]
 
 def line_of_offset(text: str, off: int) -> int:
@@ -238,28 +212,18 @@ def pack_decl_issue(decl_unit: Unit, decl_line: int, decl_text: str,
         "meta": meta or {}
     }
 
-# =========================
-# Symbol table & DDIC resolution
-# =========================
-STRUCT_INCLUDE_MAP: Dict[str, str] = {}   # local_struct(lower) -> DDIC struct (UPPER)
+# -------- Symbol table & DDIC --------
+STRUCT_INCLUDE_MAP: Dict[str, str] = {}
 
 def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
-    """
-    Resolve DDIC info for:
-      - Table field "TAB-FLD" (uppercased)
-      - Data element "DE" (uppercased)
-    """
     if not token: return None
     t = token.strip().upper()
 
-    # direct TAB-FLD?
     if "-" in t:
         info = DDIC.table_field(t)
-        if info:  # {"len":..., "dec":...}
+        if info:
             kind = "amount" if info.get("dec") is not None else "char"
             return {"len": info.get("len"), "dec": info.get("dec"), "kind": kind, "source": info.get("source")}
-
-        # local_struct-field mapped to DDIC struct?
         parts = t.split("-")
         if len(parts) == 2:
             local_struct = parts[0].lower()
@@ -272,7 +236,6 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
                     return {"len": info2.get("len"), "dec": info2.get("dec"), "kind": kind, "source": info2.get("source")}
         return None
 
-    # data element?
     de = DDIC.data_element(t)
     if de:
         kind = "amount" if de.get("dec") is not None else "char"
@@ -282,21 +245,21 @@ def ddic_lookup_token(token: str) -> Optional[Dict[str, Any]]:
 def _parse_struct_block(name: str, body: str, symtab: Dict[str, Dict[str, Any]]):
     struct = (name or "").lower()
     body = body or ""
-    # record INCLUDE STRUCTURE for mapping
+    # INCLUDE STRUCTURE mapping
     for inc in re.finditer(r"\bINCLUDE\s+STRUCTURE\s+(\w+)\b", body, re.IGNORECASE):
         STRUCT_INCLUDE_MAP[struct] = inc.group(1).upper()
 
-    # normalize inner leading "DATA:" prefixes
+    # strip inner "DATA:" prefixes if present
     body_norm = re.sub(r"(?mi)^\s*DATA\s*:\s*", "", body)
 
-    # Split by commas/newlines; tolerate comma-chained components
+    # Split by commas or newlines
     for raw in re.split(r",\s*\n|\n|,", body_norm):
         ln = (raw or "").strip().rstrip(",.")
         if not ln: continue
         if re.search(r"\bINCLUDE\s+STRUCTURE\b", ln, re.IGNORECASE):
             continue
 
-        # field LIKE TAB-FLD
+        # LIKE/TYPE TAB-FLD
         m_like = re.search(r"^(\w+)\s+(?:LIKE|TYPE)\s+([A-Za-z_]\w*)-([A-Za-z_]\w*)\b", ln, re.IGNORECASE)
         if m_like:
             fld = m_like.group(1).lower()
@@ -335,48 +298,37 @@ def _parse_struct_block(name: str, body: str, symtab: Dict[str, Dict[str, Any]])
             continue
 
 def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Build a symbol table of declarations (var or struct-field) with kind/len/dec.
-    Sources:
-      - DATA/STATICS/PARAMETERS single-line declarations
-      - Colon-style headers (multi-entry)
-      - Structure blocks, both "chained" and "classic", including INCLUDE STRUCTURE mapping
-    """
     STRUCT_INCLUDE_MAP.clear()
     st: Dict[str, Dict[str, Any]] = {}
 
-    # Structure blocks first
+    # Structure blocks
     for m in STRUCT_BLOCK_RE.finditer(full_src):
-        name = m.group(1); body = m.group("body")
-        _parse_struct_block(name, body, st)
+        _parse_struct_block(m.group(1), m.group("body"), st)
     for m in CLASSIC_STRUCT_BLOCK_RE.finditer(full_src):
-        name = m.group("name"); body = m.group("body")
-        _parse_struct_block(name, body, st)
+        _parse_struct_block(m.group("name"), m.group("body"), st)
+    # *** NEW: data-list style (BEGIN ... ,  END ... ,) ***
+    for m in DATA_LIST_STRUCT_RE.finditer(full_src):
+        _parse_struct_block(m.group("name"), m.group("body"), st)
 
-    # Other declarations (single-line + colon body)
+    # Other declarations
     for stmt, _, _ in iter_statements_with_offsets(full_src):
         s = stmt.strip()
         if not s: continue
 
-        # single-line patterns
         m = DECL_CHAR_LEN_PAREN.search(s)
         if m: st[m.group(2).lower()] = {"kind": "char", "len": int(m.group(3))}
         m = DECL_CHAR_LEN_EXPL.search(s)
         if m: st[m.group(2).lower()] = {"kind": "char", "len": int(m.group(3))}
         m = DECL_PACKED.search(s)
         if m:
-            st[m.group(2).lower()] = {
-                "kind": "packed",
-                "len": int(m.group(3)) if m.group(3) else None,
-                "dec": int(m.group(4)) if m.group(4) else None,
-            }
+            st[m.group(2).lower()] = {"kind": "packed",
+                                      "len": int(m.group(3)) if m.group(3) else None,
+                                      "dec": int(m.group(4)) if m.group(4) else None}
         m = DECL_DEC_TYPE.search(s)
         if m:
-            st[m.group(2).lower()] = {
-                "kind": "dec",
-                "len": int(m.group(3)) if m.group(3) else None,
-                "dec": int(m.group(4)) if m.group(4) else None,
-            }
+            st[m.group(2).lower()] = {"kind": "dec",
+                                      "len": int(m.group(3)) if m.group(3) else None,
+                                      "dec": int(m.group(4)) if m.group(4) else None}
         m = DECL_TYPE_GENERIC.search(s)
         if m:
             var, de = m.group(2).lower(), m.group(3)
@@ -385,7 +337,6 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                 st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
                            "len": info.get("len"), "dec": info.get("dec"), "ddic": de}
 
-        # colon-style (multi-entry) — parsed after single-line so it can overwrite
         mcol = DECL_HEADER_COLON.match(s)
         if mcol:
             body = mcol.group("body")
@@ -395,23 +346,17 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                 if not em: continue
                 var = (em.group("var") or "").lower()
                 if not var: continue
-
                 if em.group("charlen"):
                     st[var] = {"kind": "char", "len": int(em.group("charlen"))}
                     continue
-
                 dtype = (em.group("dtype") or "").upper()
                 ln    = int(em.group("len")) if em.group("len") else None
                 dec   = int(em.group("dec")) if em.group("dec") else None
-
-                # LIKE/TYPE to TAB-FLD or DE
-                info = ddic_lookup_token(dtype) if dtype else None
+                info  = ddic_lookup_token(dtype) if dtype else None
                 if info:
                     st[var] = {"kind": ("amount" if info["dec"] is not None else "char"),
                                "len": info.get("len"), "dec": info.get("dec"), "ddic": dtype}
                     continue
-
-                # Explicit P/DEC via colon entry
                 if dtype == "P":
                     st[var] = {"kind": "packed", "len": ln, "dec": dec}
                 elif dtype == "DEC":
@@ -420,7 +365,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
                     st[var] = {"kind": "char", "len": ln}
 
     if DEBUG_SYMTAB:
-        print("\n[DEBUG] Symbol table (amount-related & others):")
+        print("\n[DEBUG] Symbol table:")
         for k in sorted(st.keys()):
             print(f"  {k} -> {st[k]}")
         if STRUCT_INCLUDE_MAP:
@@ -428,12 +373,9 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
             for k,v in STRUCT_INCLUDE_MAP.items():
                 print(f"  {k} -> {v}")
         print("")
-
     return st
 
-# =========================
-# Declaration index
-# =========================
+# -------- Declaration index (for mirrors) --------
 class DeclSite:
     __slots__ = ("var","unit_idx","line","text")
     def __init__(self, var: str, unit_idx: int, line: int, text: str):
@@ -452,8 +394,6 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
         for stmt, s_off, _ in iter_statements_with_offsets(src):
             stripped = stmt.strip()
             if not stripped: continue
-
-            # single-line
             for pat in DECL_LINE_PATTERNS:
                 m = pat.match(stripped)
                 if m:
@@ -461,11 +401,8 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
                     if var:
                         idx.setdefault(var, []).append(DeclSite(var, uidx, line_of_offset(src, s_off), stripped))
                     break
-
-            # colon-style per-entry
             mcol = DECL_HEADER_COLON.match(stripped)
-            if not mcol:
-                continue
+            if not mcol: continue
             body = mcol.group("body")
             if body.endswith("."): body = body[:-1]
             body_rel_off = stripped.find(body)
@@ -486,16 +423,12 @@ def build_declaration_index(units: List[Unit]) -> Dict[str, List[DeclSite]]:
                 )
     return idx
 
-# =========================
-# AFLE helpers
-# =========================
+# -------- AFLE helpers --------
 def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
     expr = (expr or "").strip()
-    # DDIC lookup of explicit TAB-FLD/DE or mapped struct-field
     dd = ddic_lookup_token(expr)
     if dd and dd["kind"] == "amount":
         return True
-    # symbol table lookup: VAR or struct-field
     mv = re.match(rf"^({TOKEN})$", expr)
     if mv:
         info = symtab.get(mv.group(1).lower())
@@ -538,7 +471,6 @@ def _emit_decl_mirrors(dest_token: str,
                        units: List[Unit],
                        mirror_buckets: MirrorBucket,
                        too_small: Optional[bool]):
-    # Mirror a finding at the declaration site of a simple variable
     if not re.match(r"^[A-Za-z_]\w*$", dest_token or ""):
         return
     decls = decl_index.get(dest_token.lower()) or []
@@ -555,29 +487,14 @@ def _emit_decl_mirrors(dest_token: str,
             msg = f"Declaration of '{dest_token}' capacity unknown for AFLE amount usage at {usage_unit.inc_name}/{usage_unit.name} line {usage_line}."
             sev = "info"; sug = f"Verify declaration supports AFLE (≥{MIN_DIGITS_FOR_AMOUNT} digits)."
             itype = "DeclarationAFLECapacityUnknown"
-        mirror = pack_decl_issue(
-            decl_unit=decl_unit,
-            decl_line=d.line,
-            decl_text=d.text,
-            issue_type=itype,
-            message=msg,
-            severity=sev,
-            suggestion=sug,
-            meta={}
-        )
+        mirror = pack_decl_issue(decl_unit, d.line, d.text, itype, msg, sev, sug, {})
         mirror_buckets.setdefault(d.unit_idx, []).append(mirror)
 
 def _select_list_has_amounts(select_list: str, symtab: Dict[str, Dict[str, Any]]) -> bool:
-    if not select_list: return False
-    tokens = re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", select_list)
-    for t in tokens:
-        if is_amount_like(symtab, t):
-            return True
-    return False
+    tokens = re.findall(r"[A-Za-z_]\w+(?:-[A-Za-z_]\w+)?", select_list or "")
+    return any(is_amount_like(symtab, t) for t in tokens)
 
-# =========================
-# Scanner
-# =========================
+# -------- Scanner --------
 def scan_unit(unit_idx: int,
               unit: Unit,
               symtab: Dict[str, Dict[str, Any]],
@@ -587,7 +504,6 @@ def scan_unit(unit_idx: int,
     src = unit.code or ""
     findings: List[Dict[str, Any]] = []
 
-    # Concatenations / string ops with amount-like tokens
     for m in CONCATENATE_STMT.finditer(src):
         seg = m.group(0)
         if any(is_amount_like(symtab, t) for t in re.findall(TOKEN, seg)):
@@ -609,7 +525,6 @@ def scan_unit(unit_idx: int,
                                        "info", m.start(), m.end(),
                                        "Templates OK for UI; avoid persisting templated amounts."))
 
-    # Offset/length access
     for m in OFFSET_LEN.finditer(src):
         var, off, ln = m.group(1), int(m.group(2)), int(m.group(3))
         if is_amount_like(symtab, var):
@@ -618,7 +533,6 @@ def scan_unit(unit_idx: int,
                                        "warning", m.start(), m.end(),
                                        "Do not slice amounts; use numeric ops or formatting."))
 
-    # MOVE ... TO ...
     for m in MOVE_STMT.finditer(src):
         src_exp, dest = m.group(1).strip(), m.group(2)
         if not is_amount_like(symtab, src_exp):
@@ -636,7 +550,6 @@ def scan_unit(unit_idx: int,
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
                                usage["line"], decl_index, units, mirror_buckets, True if too_small else None)
 
-    # Assignment =
     for m in ASSIGNMENT.finditer(src):
         dest, src_exp = m.group(1), m.group(2)
         if not is_amount_like(symtab, src_exp):
@@ -654,7 +567,6 @@ def scan_unit(unit_idx: int,
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
                                usage["line"], decl_index, units, mirror_buckets, True if too_small else None)
 
-    # IF comparisons
     for m in IF_BLOCK.finditer(src):
         cond = m.group(1)
         for c in SIMPLE_CMP.finditer(cond):
@@ -663,7 +575,6 @@ def scan_unit(unit_idx: int,
             right_is_amt = is_amount_like(symtab, right)
             if not (left_is_amt or right_is_amt):
                 continue
-            # literal on other side?
             is_lit = bool(re.match(r"^'.*'$", right)) or right.replace(".","",1).isdigit() \
                      or bool(re.match(r"^'.*'$", left))  or left.replace(".","",1).isdigit()
             other = right if left_is_amt else left
@@ -691,7 +602,6 @@ def scan_unit(unit_idx: int,
                                            "info", m.start(), m.end(),
                                            f"Verify the other side supports AFLE (≥{MIN_DIGITS_FOR_AMOUNT} digits)."))
 
-    # SELECT ... INTO (only if select list has amount-like tokens)
     for m in SELECT_INTO.finditer(src):
         select_list = m.group(1); dest = m.group(2)
         if not _select_list_has_amounts(select_list, symtab):
@@ -713,7 +623,6 @@ def scan_unit(unit_idx: int,
                                        "info", m.start(), m.end(),
                                        f"Verify destination vs DB; use AFLE-compliant type (≥{MIN_DIGITS_FOR_AMOUNT} digits)."))
 
-    # WRITE TO <char target>
     for m in WRITE_TO_STMT.finditer(src):
         target = m.group(2)
         cshort = char_too_short(symtab, target, min_len=MIN_CHAR_FOR_AMOUNT)
@@ -727,34 +636,25 @@ def scan_unit(unit_idx: int,
     res["amount_findings"] = findings
     return res
 
-# =========================
-# Orchestrator
-# =========================
+# -------- Orchestrator & API --------
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     flat_src = "\n".join(u.code or "" for u in units)
     symtab = build_symbol_table(flat_src)
     decl_index = build_declaration_index(units)
 
-    mirror_buckets: MirrorBucket = {}
+    mirror_buckets: Dict[int, List[Dict[str, Any]]] = {}
     results = []
     for idx, u in enumerate(units):
         results.append(scan_unit(idx, u, symtab, decl_index, units, mirror_buckets))
-
-    # inject mirrors
     for uidx, mirrors in mirror_buckets.items():
         if mirrors and uidx < len(results):
             results[uidx].setdefault("amount_findings", []).extend(mirrors)
     return results
 
-# =========================
-# API
-# =========================
 @app.post("/scan-amount")
 def scan_amount(units: List[Unit]):
-    t0 = time.perf_counter()
-    out = analyze_units(units)
-    _ = time.perf_counter() - t0  # elapsed (unused)
-    return out
+    _ = time.perf_counter()
+    return analyze_units(units)
 
 @app.get("/health")
 def health():
