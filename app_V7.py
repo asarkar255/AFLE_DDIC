@@ -1,6 +1,5 @@
 # app_afle_amount_scan.py
 # Offline AFLE (SAP Note 2610650) amount scanner using ddic.json
-# v1.2 — expression-aware amount detection (handles: refe3 = rf02l-oblig - knkk-klimk)
 # Now supports structure blocks inside comma-terminated DATA lists:
 #   DATA:
 #     BEGIN OF s, ... field(n) TYPE p, ... END OF s,
@@ -22,7 +21,7 @@ MIN_CHAR_FOR_AMOUNT     = int(os.getenv("MIN_CHAR_FOR_AMOUNT", "25"))
 SUPPRESS_UNKNOWN        = os.getenv("SUPPRESS_UNKNOWN", "false").lower() == "true"
 DEBUG_SYMTAB            = os.getenv("DEBUG_SYMTAB", "false").lower() in {"1","true","yes","y"}
 
-app = FastAPI(title="AFLE Amount Scanner (offline ddic.json)", version="1.2")
+app = FastAPI(title="AFLE Amount Scanner (offline ddic.json)", version="1.1")
 
 # -------- Models --------
 class Finding(BaseModel):
@@ -121,7 +120,8 @@ CLASSIC_STRUCT_BLOCK_RE = re.compile(
     ^\s*END\s+OF\s+(?P=name)\s*\.\s*
     """, re.MULTILINE
 )
-# 3) data-list style with commas: BEGIN OF s, ... END OF s,
+# 3) *** NEW *** data-list style with commas:
+#    BEGIN OF s, ... END OF s,
 DATA_LIST_STRUCT_RE = re.compile(
     r"""(?isx)
     ^\s*BEGIN\s+OF\s+(?P<name>\w+)[^,\n]*,\s*   # 'BEGIN OF name,' (comma)
@@ -142,9 +142,6 @@ STRING_OP_AND    = re.compile(r"(.+?)\s*&&\s*(.+?)")
 STRING_TEMPLATE  = re.compile(r"\|.*?\{[^}]*\}\|", re.IGNORECASE | re.DOTALL)
 OFFSET_LEN       = re.compile(rf"\b({TOKEN})\s*\+\s*(\d+)\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
 WRITE_TO_STMT    = re.compile(r"\bWRITE\s+(.+?)\bTO\b\s+(\w+)\b", re.IGNORECASE)
-
-# [AFLE-expr] Optional arithmetic/operator regex (not strictly needed, kept for clarity)
-ARITH_OP_RE = re.compile(r"[+\-*/()]", re.UNICODE)
 
 # -------- Helpers --------
 def iter_statements_with_offsets(src: str):
@@ -309,6 +306,7 @@ def build_symbol_table(full_src: str) -> Dict[str, Dict[str, Any]]:
         _parse_struct_block(m.group(1), m.group("body"), st)
     for m in CLASSIC_STRUCT_BLOCK_RE.finditer(full_src):
         _parse_struct_block(m.group("name"), m.group("body"), st)
+    # *** NEW: data-list style (BEGIN ... ,  END ... ,) ***
     for m in DATA_LIST_STRUCT_RE.finditer(full_src):
         _parse_struct_block(m.group("name"), m.group("body"), st)
 
@@ -438,20 +436,6 @@ def is_amount_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
             return True
     return False
 
-# [AFLE-expr] NEW: tokenize expression and treat expression as amount-like if ANY token is amount-like
-def extract_tokens(expr: str) -> List[str]:
-    """Return ABAP-like tokens (var or tab-fld like KNKK-KLIMK) from an arbitrary expression."""
-    if not expr:
-        return []
-    return re.findall(TOKEN, expr)
-
-def is_amount_expr_like(symtab: Dict[str, Dict[str, Any]], expr: str) -> bool:
-    """Expression-level amount detection: if ANY token is amount-like, the expression is amount-like."""
-    for t in extract_tokens(expr):
-        if is_amount_like(symtab, t):
-            return True
-    return False
-
 def char_too_short(symtab: Dict[str, Dict[str, Any]], token: str, min_len: int = MIN_CHAR_FOR_AMOUNT) -> Optional[bool]:
     dd = ddic_lookup_token(token)
     if dd and dd["kind"] == "char":
@@ -549,10 +533,9 @@ def scan_unit(unit_idx: int,
                                        "warning", m.start(), m.end(),
                                        "Do not slice amounts; use numeric ops or formatting."))
 
-    # [AFLE-expr] MOVE ... TO ...
     for m in MOVE_STMT.finditer(src):
         src_exp, dest = m.group(1).strip(), m.group(2)
-        if not is_amount_expr_like(symtab, src_exp):   # << changed
+        if not is_amount_like(symtab, src_exp):
             continue
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
@@ -560,17 +543,16 @@ def scan_unit(unit_idx: int,
         sev = "error" if too_small else (None if SUPPRESS_UNKNOWN else "info")
         if sev:
             usage = pack_issue(unit, "OldMoveLengthConflict",
-                               f"Moving amount expression into {dest} " + ("(too small)." if too_small else "(destination capacity unknown)."),
+                               f"Moving amount into {dest} " + ("(too small)." if too_small else "(destination capacity unknown)."),
                                sev, m.start(), m.end(),
                                f"Use AFLE-safe type (≥{MIN_DIGITS_FOR_AMOUNT} digits), e.g. P LENGTH 23 DECIMALS 2 or appropriate DDIC element.")
             findings.append(usage)
             _emit_decl_mirrors(dest, usage["issue_type"], usage["severity"], unit,
                                usage["line"], decl_index, units, mirror_buckets, True if too_small else None)
 
-    # [AFLE-expr] dest = <expr>.
     for m in ASSIGNMENT.finditer(src):
         dest, src_exp = m.group(1), m.group(2)
-        if not is_amount_expr_like(symtab, src_exp):   # << changed
+        if not is_amount_like(symtab, src_exp):
             continue
         cshort = char_too_short(symtab, dest)
         dshort = dec_too_short(symtab, dest)
@@ -578,7 +560,7 @@ def scan_unit(unit_idx: int,
         sev = "error" if too_small else (None if SUPPRESS_UNKNOWN else "info")
         if sev:
             usage = pack_issue(unit, "OldMoveLengthConflict",
-                               f"Assignment from amount expression into {dest} " + ("(too small)." if too_small else "(type unknown)."),
+                               f"Assignment from amount into {dest} " + ("(too small)." if too_small else "(type unknown)."),
                                sev, m.start(), m.end(),
                                f"Ensure destination is AFLE-safe (≥{MIN_DIGITS_FOR_AMOUNT} digits).")
             findings.append(usage)
